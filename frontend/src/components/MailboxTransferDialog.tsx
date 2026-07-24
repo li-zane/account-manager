@@ -57,6 +57,7 @@ function fieldValue(mailbox: MailboxRecord, target: string): string {
     case 'kind': return mailbox.kind
     case 'client_id': return ''
     case 'refresh_token': return mailbox.auth.refreshTokenExpiresAt ? '[由服务端导出]' : ''
+    case 'pickup_key': return '[由服务端导出]'
     default: return ''
   }
 }
@@ -218,7 +219,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
   const [customName, setCustomName] = useState('自定义邮箱格式')
   const [customKind, setCustomKind] = useState<MailboxFormat['kind']>('delimited')
   const [customDirection, setCustomDirection] = useState<MailboxFormat['direction']>('both')
-  const [customProvider, setCustomProvider] = useState('')
+  const [customProvider, setCustomProvider] = useState<NonNullable<MailboxFormat['provider']> | ''>('')
   const [customDelimiter, setCustomDelimiter] = useState(',')
   const [customHeader, setCustomHeader] = useState(true)
   const [customFields, setCustomFields] = useState('email=address,provider=provider,display_name=display_name,client_id=client_id,refresh_token=refresh_token')
@@ -237,8 +238,19 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
   const [error, setError] = useState<string>()
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const availableFormats = useMemo(() => formats.filter((format) => format.enabled && (format.direction === 'both' || format.direction === mode)), [formats, mode])
+  const selectedProviders = useMemo<Set<NonNullable<MailboxFormat['provider']>>>(() => {
+    const roots = exportScope === 'all'
+      ? mailboxes
+      : mailboxes.filter((mailbox) => selectedIds.has(mailbox.id) || mailbox.children.some((child) => selectedIds.has(child.id)))
+    return new Set(roots.map((mailbox) => mailbox.provider === 'cloudflare' ? 'cloudflare_route' : mailbox.provider === 'google' ? 'gmail' : 'microsoft'))
+  }, [exportScope, mailboxes, selectedIds])
+  const availableFormats = useMemo(() => formats.filter((format) => {
+    if (!format.enabled || (format.direction !== 'both' && format.direction !== mode)) return false
+    if (mode !== 'export' || !format.provider) return true
+    return selectedProviders.size === 1 && selectedProviders.has(format.provider)
+  }), [formats, mode, selectedProviders])
   const activeFormat = availableFormats.find((format) => format.id === formatId) ?? availableFormats[0] ?? builtInMailboxFormats[0]
+  const sensitiveRequired = activeFormat.fields.some((field) => field.required && field.sensitive)
   const selectedRootIds = useMemo(() => {
     if (exportScope === 'all') return mailboxes.map((mailbox) => mailbox.id)
     return mailboxes.filter((mailbox) => selectedIds.has(mailbox.id) || mailbox.children.some((child) => selectedIds.has(child.id))).map((mailbox) => mailbox.id)
@@ -282,6 +294,10 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
       setFormatId(availableFormats[0].id)
     }
   }, [availableFormats, formatId])
+
+  useEffect(() => {
+    if (mode === 'export' && sensitiveRequired) setIncludeSensitive(true)
+  }, [mode, sensitiveRequired])
 
   useEffect(() => {
     if (!open) return
@@ -350,7 +366,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
     try {
       const result = source === 'mock'
         ? localExportResult
-        : await apiClient.exportMailboxes({ formatId: activeFormat.id, mailboxIds: selectedRootIds, includeSensitive })
+        : await apiClient.exportMailboxes({ formatId: activeFormat.id, mailboxIds: selectedRootIds, includeSensitive: includeSensitive || sensitiveRequired })
       setExportResult(result)
       triggerDownload(result)
     } catch (reason) {
@@ -428,7 +444,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
                 <label className="transfer-field"><span>格式名称</span><input value={customName} onChange={(event) => setCustomName(event.target.value)} /></label>
                 <label className="transfer-field"><span>类型</span><span className="select-control select-control--wide"><select value={customKind} onChange={(event) => { const kind = event.target.value as MailboxFormat['kind']; setCustomKind(kind); if (kind === 'template') setCustomDirection('export') }}><option value="delimited">分隔文本</option><option value="json">JSON</option><option value="template">模板文本</option></select><ChevronDown /></span></label>
                 <label className="transfer-field"><span>用途</span><span className="select-control select-control--wide"><select value={customDirection} onChange={(event) => setCustomDirection(event.target.value as MailboxFormat['direction'])}><option value="both" disabled={customKind === 'template'}>导入与导出</option><option value="import" disabled={customKind === 'template'}>仅导入</option><option value="export">仅导出</option></select><ChevronDown /></span></label>
-                <label className="transfer-field"><span>邮箱平台</span><span className="select-control select-control--wide"><select value={customProvider} onChange={(event) => setCustomProvider(event.target.value)}><option value="">由数据指定</option><option value="microsoft">Microsoft</option><option value="gmail">Google</option><option value="cloudflare_route">Cloudflare</option></select><ChevronDown /></span></label>
+                <label className="transfer-field"><span>邮箱平台</span><span className="select-control select-control--wide"><select value={customProvider} onChange={(event) => setCustomProvider(event.target.value as NonNullable<MailboxFormat['provider']> | '')}><option value="">由数据指定</option><option value="microsoft">Microsoft</option><option value="gmail">Google</option><option value="cloudflare_route">Cloudflare</option></select><ChevronDown /></span></label>
                 <label className="transfer-field"><span>分隔符</span><input value={customDelimiter} onChange={(event) => setCustomDelimiter(event.target.value)} disabled={customKind !== 'delimited'} /></label>
                 <label className="format-checkbox"><input type="checkbox" checked={customHeader} onChange={(event) => setCustomHeader(event.target.checked)} disabled={customKind !== 'delimited'} /><span><Check /></span>包含表头</label>
                 <label className="transfer-field format-editor__wide"><span>字段映射</span><input value={customFields} onChange={(event) => setCustomFields(event.target.value)} /></label>
@@ -464,7 +480,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
                 <label className="export-scope-option"><input type="radio" name="export-scope" value="all" checked={exportScope === 'all'} onChange={() => setExportScope('all')} /><span><strong>全部主邮箱</strong><small>{mailboxes.length} 个主邮箱</small></span></label>
                 <label className={selectedIds.size > 0 ? 'export-scope-option' : 'export-scope-option export-scope-option--disabled'}><input type="radio" name="export-scope" value="selected" checked={exportScope === 'selected'} onChange={() => setExportScope('selected')} disabled={selectedIds.size === 0} /><span><strong>当前选择</strong><small>{selectedIds.size} 个地址，归并为 {selectedRootIds.length} 个主邮箱</small></span></label>
               </div>
-              <label className="sensitive-toggle"><span><strong>包含敏感凭据</strong><small>由后端按管理员权限导出 Client ID 与 RT</small></span><button className={`toggle ${includeSensitive ? 'toggle--checked' : ''}`} type="button" role="switch" aria-checked={includeSensitive} onClick={() => setIncludeSensitive((value) => !value)}><span /></button></label>
+              <label className="sensitive-toggle"><span><strong>包含敏感凭据</strong><small>{sensitiveRequired ? '当前格式包含必需的本站取件密钥' : '由后端按管理员权限导出 Client ID、RT 或本站取件密钥'}</small></span><button className={`toggle ${includeSensitive || sensitiveRequired ? 'toggle--checked' : ''}`} type="button" role="switch" aria-checked={includeSensitive || sensitiveRequired} disabled={sensitiveRequired} onClick={() => setIncludeSensitive((value) => !value)}><span /></button></label>
               <div className="export-preview-heading"><span>文本预览</span><button className="icon-button icon-button--small" type="button" title="复制预览" aria-label="复制导出预览" onClick={copyPreview}><Copy /></button></div>
               <pre className="raw-preview raw-preview--export">{(exportResult?.content || localExportResult.content).slice(0, 1_600) || '当前范围没有可导出的邮箱'}</pre>
             </>

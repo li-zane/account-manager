@@ -2,13 +2,11 @@ import {
   AtSign,
   CheckCircle2,
   CircleAlert,
-  Cloud,
   Clock3,
   Copy,
   Eye,
   EyeOff,
   GitBranch,
-  Inbox,
   KeyRound,
   Link2,
   LoaderCircle,
@@ -19,7 +17,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 
 import { apiClient } from '../api/client'
-import type { MailboxCredentialSummary, MailboxDetail, MailboxRecord, RevealedCredential } from '../api/types'
+import type { MailboxCredentialSummary, MailboxDetail, MailboxRecord, RetrievalCapabilitySummary, RevealedCredential } from '../api/types'
 import { ProviderMark, providerMeta } from './ProviderMark'
 
 interface MailboxDetailDrawerProps {
@@ -30,7 +28,7 @@ interface MailboxDetailDrawerProps {
 const credentialLabels: Record<string, string> = {
   microsoft_graph_oauth: 'Microsoft Graph OAuth',
   microsoft_imap_oauth: 'Microsoft IMAP OAuth',
-  microsoft_dual_token: 'Microsoft 双令牌',
+  microsoft_dual_token: 'Microsoft 共享 RT',
   gmail_oauth: 'Google OAuth',
   imap_password: 'IMAP 密码',
 }
@@ -69,18 +67,23 @@ function inferCredential(mailbox: MailboxRecord): MailboxCredentialSummary {
         : mailbox.auth.modes.includes('graph')
           ? 'microsoft_graph_oauth'
           : 'imap_password'
+  const methods = credentialType === 'microsoft_dual_token'
+    ? ['microsoft_graph', 'outlook_rest', 'imap_oauth']
+    : credentialType === 'microsoft_graph_oauth'
+      ? ['microsoft_graph', 'outlook_rest']
+      : credentialType === 'microsoft_imap_oauth'
+        ? ['imap_oauth']
+        : []
   return {
     credentialType,
-    retrievalMethods: credentialType === 'microsoft_dual_token'
-      ? ['microsoft_graph', 'imap_oauth']
-      : credentialType === 'microsoft_graph_oauth'
-        ? ['microsoft_graph']
-        : credentialType === 'microsoft_imap_oauth'
-          ? ['imap_oauth']
-          : [],
+    retrievalMethods: methods,
+    retrievalCapabilities: methods.map((method) => ({
+      method,
+      status: 'unknown',
+      accessTokenExpiresAt: method === 'imap_oauth' ? mailbox.auth.imapAccessTokenExpiresAt : mailbox.auth.graphAccessTokenExpiresAt,
+    })),
     hasRefreshToken: false,
-    hasGraphRefreshToken: false,
-    hasImapRefreshToken: false,
+    refreshTokenValidity: mailbox.auth.refreshTokenValidity,
     expiresAt: mailbox.auth.refreshTokenExpiresAt,
     refreshStatus: 'unknown',
     autoRefresh: mailbox.auth.autoRefresh,
@@ -106,66 +109,40 @@ function MaskedValue({ value, fallback = '未同步' }: { value?: string; fallba
   return <span className={value ? 'detail-value detail-value--mono' : 'detail-value detail-value--muted'}>{value || fallback}</span>
 }
 
-function isDualCredential(credential: MailboxCredentialSummary): boolean {
-  return credential.credentialType === 'microsoft_dual_token'
-    || (credential.retrievalMethods.includes('microsoft_graph') && credential.retrievalMethods.includes('imap_oauth'))
+const retrievalMethodLabels: Record<string, string> = {
+  microsoft_graph: 'Graph',
+  outlook_rest: 'Outlook REST',
+  imap_oauth: 'IMAP',
+  gmail_api: 'Gmail API',
+  imap_password: 'IMAP',
 }
 
-function usesLegacyDualTokenSummary(credential: MailboxCredentialSummary): boolean {
-  return isDualCredential(credential)
-    && !credential.hasGraphRefreshToken
-    && !credential.hasImapRefreshToken
-    && !credential.maskedGraphRefreshToken
-    && !credential.maskedImapRefreshToken
+const capabilityStatusLabels: Record<RetrievalCapabilitySummary['status'], string> = {
+  verified: '取件已验证',
+  configured: '通道已配置',
+  failed: '最近验证失败',
+  unknown: '尚未验证',
 }
 
-function CredentialMethodRow({
-  method,
-  credential,
-  revealed,
-}: {
-  method: 'graph' | 'imap'
-  credential: MailboxCredentialSummary
-  revealed?: RevealedCredential
-}) {
-  const isGraph = method === 'graph'
-  const legacyFallback = usesLegacyDualTokenSummary(credential)
-  const hasToken = isGraph
-    ? credential.hasGraphRefreshToken || (legacyFallback && credential.hasRefreshToken)
-    : credential.hasImapRefreshToken || (legacyFallback && credential.hasRefreshToken)
-  const token = isGraph
-    ? revealed?.graphRefreshToken ?? credential.maskedGraphRefreshToken ?? (legacyFallback ? revealed?.refreshToken ?? credential.maskedRefreshToken : undefined)
-    : revealed?.imapRefreshToken ?? credential.maskedImapRefreshToken ?? (legacyFallback ? revealed?.refreshToken ?? credential.maskedRefreshToken : undefined)
-  const expiresAt = isGraph
-    ? revealed?.graphTokenExpiresAt ?? credential.graphTokenExpiresAt ?? (hasToken ? revealed?.expiresAt ?? credential.expiresAt : undefined)
-    : revealed?.imapTokenExpiresAt ?? credential.imapTokenExpiresAt ?? (legacyFallback ? revealed?.expiresAt ?? credential.expiresAt : undefined)
+function credentialCapabilities(credential: MailboxCredentialSummary, revealed?: RevealedCredential): RetrievalCapabilitySummary[] {
+  const supplied = revealed?.retrievalCapabilities.length ? revealed.retrievalCapabilities : credential.retrievalCapabilities
+  if (supplied.length > 0) return supplied
+  return credential.retrievalMethods.map((method) => ({
+    method,
+    status: 'unknown',
+    accessTokenExpiresAt: method === 'imap_oauth'
+      ? revealed?.imapTokenExpiresAt || credential.imapTokenExpiresAt
+      : method === 'microsoft_graph' || method === 'outlook_rest'
+        ? revealed?.graphTokenExpiresAt || credential.graphTokenExpiresAt
+        : revealed?.expiresAt || credential.expiresAt,
+  }))
+}
 
-  return (
-    <div className="credential-method-row">
-      <div className="credential-method-row__heading">
-        <span className={isGraph ? 'credential-method-icon credential-method-icon--graph' : 'credential-method-icon credential-method-icon--imap'} aria-hidden="true">
-          {isGraph ? <Cloud /> : <Inbox />}
-        </span>
-        <span>
-          <strong>{isGraph ? 'Graph API' : 'IMAP OAuth'}</strong>
-          <small>{isGraph ? 'microsoft_graph' : 'imap_oauth'}</small>
-        </span>
-      </div>
-      <span className={hasToken ? 'detail-state detail-state--on' : 'detail-state detail-state--missing'}>
-        {hasToken ? <CheckCircle2 /> : <CircleAlert />}{hasToken ? 'RT 已配置' : 'RT 未配置'}
-      </span>
-      <dl className="credential-method-row__details">
-        <div>
-          <dt>Refresh Token</dt>
-          <dd><MaskedValue value={token} fallback={hasToken ? '已配置' : '未配置'} /></dd>
-        </div>
-        <div>
-          <dt>访问令牌有效期</dt>
-          <dd><span className="detail-value"><Clock3 />{formatDate(expiresAt)}</span></dd>
-        </div>
-      </dl>
-    </div>
-  )
+function rtValidityLabel(mailbox: MailboxRecord, credential: MailboxCredentialSummary): string {
+  if (credential.credentialType === 'imap_password') return '不适用'
+  if (!credential.hasRefreshToken || credential.refreshTokenValidity === 'missing') return '未配置'
+  if (credential.refreshTokenValidity === 'error') return '状态异常，未提供固定到期日'
+  return mailbox.provider === 'microsoft' ? '微软未提供固定到期日' : '上游未提供固定到期日'
 }
 
 export function MailboxDetailDrawer({ mailbox, onClose }: MailboxDetailDrawerProps) {
@@ -209,12 +186,8 @@ export function MailboxDetailDrawer({ mailbox, onClose }: MailboxDetailDrawerPro
   const activeCredential = useMemo(() => {
     return detail.credentials.find((credential) => credential.credentialType === selectedType) ?? detail.credentials[0]
   }, [detail.credentials, selectedType])
-  const activeIsDual = activeCredential ? isDualCredential(activeCredential) : false
-  const hasRevealableToken = Boolean(activeCredential && (
-    activeCredential.hasRefreshToken
-    || activeCredential.hasGraphRefreshToken
-    || activeCredential.hasImapRefreshToken
-  ))
+  const hasRevealableToken = Boolean(activeCredential?.hasRefreshToken)
+  const capabilities = useMemo(() => activeCredential ? credentialCapabilities(activeCredential, revealed) : [], [activeCredential, revealed])
 
   const reveal = async () => {
     setRevealing(true)
@@ -278,20 +251,23 @@ export function MailboxDetailDrawer({ mailbox, onClose }: MailboxDetailDrawerPro
                 <dl className="credential-grid">
                   <div><dt>Client ID</dt><dd><MaskedValue value={revealed?.clientId || activeCredential.clientId} /></dd></div>
                   <div><dt>凭据类型</dt><dd><span className="detail-value">{credentialLabels[activeCredential.credentialType] || activeCredential.credentialType}</span></dd></div>
-                  {!activeIsDual && <div className="credential-grid__wide"><dt>Refresh Token</dt><dd><MaskedValue value={revealed?.refreshToken || activeCredential.maskedRefreshToken} fallback={activeCredential.hasRefreshToken ? '已配置' : '未配置'} /></dd></div>}
-                  <div><dt>{activeIsDual ? '刷新状态' : 'RT 状态'}</dt><dd><span className={activeCredential.refreshStatus === 'error' || activeCredential.refreshStatus === 'unreadable' ? 'detail-state detail-state--error' : hasRevealableToken ? 'detail-state detail-state--on' : 'detail-state'}><RefreshCw />{activeCredential.credentialType === 'imap_password' ? '不适用' : refreshStatusLabels[activeCredential.refreshStatus] || activeCredential.refreshStatus}</span></dd></div>
-                  {!activeIsDual && <div><dt>访问令牌有效期</dt><dd><span className="detail-value"><Clock3 />{formatDate(revealed?.expiresAt || activeCredential.expiresAt)}</span></dd></div>}
+                  <div className="credential-grid__wide"><dt>共享 Refresh Token</dt><dd><MaskedValue value={revealed?.refreshToken || activeCredential.maskedRefreshToken} fallback={activeCredential.hasRefreshToken ? '已配置' : '未配置'} /></dd></div>
+                  <div><dt>RT 状态</dt><dd><span className={activeCredential.refreshStatus === 'error' || activeCredential.refreshStatus === 'unreadable' ? 'detail-state detail-state--error' : hasRevealableToken ? 'detail-state detail-state--on' : 'detail-state'}><RefreshCw />{activeCredential.credentialType === 'imap_password' ? '不适用' : refreshStatusLabels[activeCredential.refreshStatus] || activeCredential.refreshStatus}</span></dd></div>
+                  <div><dt>RT 有效期</dt><dd><span className="detail-value"><Clock3 />{rtValidityLabel(mailbox, activeCredential)}</span></dd></div>
                   <div><dt>自动刷新</dt><dd><span className={activeCredential.autoRefresh ? 'detail-state detail-state--on' : 'detail-state'}><RefreshCw />{activeCredential.autoRefresh ? '已开启' : '未开启'}</span></dd></div>
                   <div><dt>计划刷新</dt><dd><span className="detail-value"><Clock3 />{formatDate(activeCredential.refreshAfter)}</span></dd></div>
                   <div><dt>上次刷新</dt><dd><span className="detail-value"><Clock3 />{formatDate(activeCredential.lastRefreshedAt)}</span></dd></div>
                   {activeCredential.lastRefreshError && <div className="credential-grid__wide"><dt>最近错误</dt><dd><span className="detail-value detail-value--error">{activeCredential.lastRefreshError}</span></dd></div>}
                 </dl>
-                {activeIsDual && (
-                  <div className="credential-methods" aria-label="Microsoft 取件通道">
-                    <CredentialMethodRow method="graph" credential={activeCredential} revealed={revealed} />
-                    <CredentialMethodRow method="imap" credential={activeCredential} revealed={revealed} />
-                  </div>
-                )}
+                <div className="credential-methods" aria-label="取件能力">
+                  {capabilities.map((capability) => (
+                    <div className="credential-method-row" key={capability.method}>
+                      <div className="credential-method-row__heading"><span><strong>{retrievalMethodLabels[capability.method] || capability.method}</strong><small>{capability.method}</small></span></div>
+                      <span className={capability.status === 'failed' ? 'detail-state detail-state--error' : capability.status === 'verified' ? 'detail-state detail-state--on' : 'detail-state'}>{capability.status === 'failed' ? <CircleAlert /> : <CheckCircle2 />}{capabilityStatusLabels[capability.status]}</span>
+                      <dl className="credential-method-row__details"><div><dt>短期 AT 有效期</dt><dd><span className="detail-value"><Clock3 />{formatDate(capability.accessTokenExpiresAt)}</span></dd></div>{capability.checkedAt && <div><dt>上次验证</dt><dd><span className="detail-value"><Clock3 />{formatDate(capability.checkedAt)}</span></dd></div>}</dl>
+                    </div>
+                  ))}
+                </div>
               </>
             ) : <div className="detail-empty"><KeyRound />此邮箱通过转发取件，不使用上游 RT 凭据</div>}
 
@@ -300,14 +276,7 @@ export function MailboxDetailDrawer({ mailbox, onClose }: MailboxDetailDrawerPro
                 {revealed ? (
                   <>
                     <span className="reveal-expiry"><ShieldCheck />临时显示至 {formatDate(revealed.revealedUntil)}</span>
-                    {activeIsDual ? (
-                      <>
-                        {revealed.graphRefreshToken && <button className="secondary-button" type="button" onClick={() => copy('Graph RT', revealed.graphRefreshToken!)}><Copy />{copied === 'Graph RT' ? '已复制' : '复制 Graph RT'}</button>}
-                        {revealed.imapRefreshToken && <button className="secondary-button" type="button" onClick={() => copy('IMAP RT', revealed.imapRefreshToken!)}><Copy />{copied === 'IMAP RT' ? '已复制' : '复制 IMAP RT'}</button>}
-                      </>
-                    ) : (
-                      <button className="secondary-button" type="button" onClick={() => copy('Refresh Token', revealed.refreshToken)}><Copy />{copied === 'Refresh Token' ? '已复制' : '复制 RT'}</button>
-                    )}
+                    <button className="secondary-button" type="button" onClick={() => copy('Refresh Token', revealed.refreshToken)}><Copy />{copied === 'Refresh Token' ? '已复制' : '复制 RT'}</button>
                     <button className="secondary-button" type="button" onClick={() => setRevealed(undefined)}><EyeOff />隐藏</button>
                   </>
                 ) : (

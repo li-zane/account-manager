@@ -9,6 +9,7 @@ type RetrievalMethod string
 
 const (
 	RetrievalMicrosoftGraph RetrievalMethod = "microsoft_graph"
+	RetrievalOutlookREST    RetrievalMethod = "outlook_rest"
 	RetrievalIMAPOAuth      RetrievalMethod = "imap_oauth"
 	RetrievalIMAPPassword   RetrievalMethod = "imap_password"
 	RetrievalDualToken      RetrievalMethod = "dual_token"

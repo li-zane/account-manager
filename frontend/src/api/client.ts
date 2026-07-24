@@ -12,6 +12,8 @@ import type {
   BackupTargetConfig,
   BackupTargetConfigSummary,
   CreateBackupTargetInput,
+  CachedMessage,
+  CachedMessagesResult,
   DashboardResult,
   MailAccessMode,
   MailboxDashboard,
@@ -31,11 +33,15 @@ import type {
   MailboxAliasDetail,
   LinkedPlatformAccount,
   MailboxRecord,
+  MessageFolder,
+  MessageProbeSettings,
+  MessageSyncState,
   MailProvider,
   ProviderConnection,
   RevealedCredential,
   RetrievalKeyStatus,
   SaveProviderConnectionInput,
+  SaveMessageProbeSettingsInput,
   SaveTokenRefreshSettingsInput,
   S3BackupConfig,
   TokenRefreshSettings,
@@ -50,12 +56,28 @@ type UnknownRecord = Record<string, unknown>
 
 export const builtInMailboxFormats: MailboxFormat[] = [
   {
+    id: 'fmt_builtin_pickup2',
+    name: '邮箱与本站取件密钥',
+    kind: 'delimited',
+    direction: 'both',
+    delimiter: '----',
+    hasHeader: false,
+    fields: [
+      { column: 'email', target: 'address', required: true },
+      { column: 'pickup_key', target: 'pickup_key', required: true, sensitive: true },
+    ],
+    builtIn: true,
+    enabled: true,
+    version: 1,
+  },
+  {
     id: 'fmt_builtin_outlook4',
     name: 'Outlook 4 段格式',
     kind: 'delimited',
     direction: 'both',
     delimiter: '----',
     hasHeader: false,
+    provider: 'microsoft',
     fields: [
       { column: 'email', target: 'address', required: true },
       { column: 'password', target: 'password', sensitive: true },
@@ -73,6 +95,7 @@ export const builtInMailboxFormats: MailboxFormat[] = [
     direction: 'both',
     delimiter: '----',
     hasHeader: false,
+    provider: 'microsoft',
     fields: [
       { column: 'email', target: 'address', required: true },
       { column: 'gpt_password', target: 'platform_account_password', sensitive: true },
@@ -162,12 +185,14 @@ function retrievalStatus(value: unknown): RetrievalKeyStatus {
 
 function accessModes(value: unknown, mailboxProvider: MailProvider): MailAccessMode[] {
   const allowed = new Set<MailAccessMode>(['graph', 'imap', 'oauth', 'forward'])
+  const supplied = Array.isArray(value) || typeof value === 'string'
   const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[+,]/) : []
   const parsed = values
     .map((item) => text(item).trim().toLowerCase())
     .filter((item): item is MailAccessMode => allowed.has(item as MailAccessMode))
 
   if (parsed.length > 0) return parsed
+  if (supplied) return []
   if (mailboxProvider === 'cloudflare') return ['forward']
   if (mailboxProvider === 'google') return ['oauth', 'imap']
   return ['graph']
@@ -230,6 +255,13 @@ function normalizeMailbox(value: unknown, parentId?: string): MailboxRecord | nu
     auth: {
       modes: accessModes(auth.modes ?? value.access_modes, mailboxProvider),
       refreshTokenExpiresAt: text(auth.refresh_token_expires_at ?? value.refresh_token_expires_at) || undefined,
+      refreshStatus: optionalText(auth.refresh_status ?? value.refresh_status),
+      refreshTokenValidity: (() => {
+        const validity = text(auth.refresh_token_validity ?? value.refresh_token_validity)
+        return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+      })(),
+      graphAccessTokenExpiresAt: text(auth.graph_access_token_expires_at ?? value.graph_access_token_expires_at) || undefined,
+      imapAccessTokenExpiresAt: text(auth.imap_access_token_expires_at ?? value.imap_access_token_expires_at) || undefined,
       autoRefresh: bool(auth.auto_refresh ?? value.auto_refresh, mailboxProvider !== 'cloudflare'),
     },
     forwarding: target
@@ -308,6 +340,23 @@ function retrievalMethods(value: unknown): string[] {
     .filter(Boolean))]
 }
 
+function normalizeRetrievalCapabilities(value: unknown): MailboxCredentialSummary['retrievalCapabilities'] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    if (!isRecord(item)) return []
+    const method = text(item.method).trim().toLowerCase()
+    const rawStatus = text(item.status).trim().toLowerCase()
+    const status = rawStatus === 'configured' || rawStatus === 'verified' || rawStatus === 'failed' || rawStatus === 'unknown' ? rawStatus : 'unknown'
+    if (!method) return []
+    return [{
+      method,
+      status,
+      accessTokenExpiresAt: optionalText(item.access_token_expires_at),
+      checkedAt: optionalText(item.checked_at),
+    }]
+  })
+}
+
 function normalizeCredential(value: unknown): MailboxCredentialSummary | null {
   if (!isRecord(value)) return null
   const metadata = isRecord(value.metadata) ? value.metadata : {}
@@ -323,29 +372,18 @@ function normalizeCredential(value: unknown): MailboxCredentialSummary | null {
     ?? metadata.masked_refresh_token
     ?? metadata.refresh_token_masked,
   )
-  const maskedGraphRefreshToken = maskedToken(
-    value.graph_refresh_token
-    ?? value.graph_refresh_token_masked
-    ?? metadata.graph_refresh_token
-    ?? metadata.graph_refresh_token_masked,
-  )
-  const maskedImapRefreshToken = maskedToken(
-    value.imap_refresh_token
-    ?? value.imap_refresh_token_masked
-    ?? metadata.imap_refresh_token
-    ?? metadata.imap_refresh_token_masked,
-  )
   return {
     id: optionalText(value.id),
     credentialType,
     clientId: optionalText(value.client_id ?? metadata.client_id),
     retrievalMethods: retrievalMethods(value.retrieval_methods ?? metadata.retrieval_methods),
+    retrievalCapabilities: normalizeRetrievalCapabilities(value.retrieval_capabilities ?? metadata.retrieval_capabilities),
     maskedRefreshToken,
     hasRefreshToken: bool(value.has_refresh_token, Boolean(maskedRefreshToken)),
-    maskedGraphRefreshToken,
-    hasGraphRefreshToken: bool(value.has_graph_refresh_token, Boolean(maskedGraphRefreshToken)),
-    maskedImapRefreshToken,
-    hasImapRefreshToken: bool(value.has_imap_refresh_token, Boolean(maskedImapRefreshToken)),
+    refreshTokenValidity: (() => {
+      const validity = text(value.refresh_token_validity)
+      return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+    })(),
     expiresAt: optionalText(value.expires_at),
     graphTokenExpiresAt: optionalText(value.graph_token_expires_at),
     imapTokenExpiresAt: optionalText(value.imap_token_expires_at),
@@ -422,6 +460,71 @@ function normalizeTokenRefreshSettings(value: unknown): TokenRefreshSettings {
   }
 }
 
+function normalizeMessageProbeSettings(value: unknown): MessageProbeSettings {
+  const payload = isRecord(value) && isRecord(value.data) ? value.data : value
+  if (!isRecord(payload)) throw new Error('邮件探测设置响应格式无效')
+  const intervalMinutes = Math.trunc(numberValue(payload.interval_minutes, 10))
+  if (intervalMinutes < 1 || intervalMinutes > 1440) throw new Error('邮件探测间隔超出范围')
+  return {
+    enabled: bool(payload.enabled),
+    intervalMinutes,
+    version: Math.max(0, Math.trunc(numberValue(payload.version))),
+    updatedAt: optionalText(payload.updated_at),
+  }
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => text(item)).filter(Boolean) : []
+}
+
+function normalizeCachedMessage(value: unknown): CachedMessage | null {
+  if (!isRecord(value)) return null
+  const id = text(value.id)
+  const receivedAt = text(value.received_at)
+  if (!id || !receivedAt) return null
+  return {
+    id,
+    providerMessageId: text(value.provider_message_id),
+    internetMessageId: optionalText(value.internet_message_id),
+    folder: text(value.folder) === 'Junk' ? 'Junk' : 'INBOX',
+    from: text(value.from),
+    to: stringList(value.to),
+    cc: stringList(value.cc),
+    subject: text(value.subject, '(无主题)'),
+    text: optionalText(value.text),
+    html: optionalText(value.html),
+    receivedAt,
+    unread: bool(value.unread),
+  }
+}
+
+function normalizeMessageSyncState(value: unknown): MessageSyncState | undefined {
+  if (!isRecord(value)) return undefined
+  const targetId = text(value.target_id)
+  const lastSyncedAt = text(value.last_synced_at)
+  if (!targetId || !lastSyncedAt) return undefined
+  return {
+    targetId,
+    lastMessageAt: optionalText(value.last_message_at),
+    lastSyncedAt,
+    lastError: optionalText(value.last_error),
+  }
+}
+
+function normalizeCachedMessagesResult(value: unknown): CachedMessagesResult {
+  const payload = isRecord(value) && isRecord(value.data) ? value.data : value
+  if (!isRecord(payload)) throw new Error('邮件缓存响应格式无效')
+  const messages = (Array.isArray(payload.messages) ? payload.messages : [])
+    .map(normalizeCachedMessage)
+    .filter((item): item is CachedMessage => item !== null)
+  return {
+    messages,
+    count: Math.max(messages.length, Math.trunc(numberValue(payload.count, messages.length))),
+    newCount: Math.max(0, Math.trunc(numberValue(payload.new_count))),
+    sync: normalizeMessageSyncState(payload.sync),
+  }
+}
+
 function normalizeMailboxDetail(value: unknown): MailboxDetail {
   if (!isRecord(value)) throw new Error('邮箱详情响应格式无效')
   const payload = isRecord(value.data) ? value.data : value
@@ -446,6 +549,12 @@ function normalizeMailboxDetail(value: unknown): MailboxDetail {
   return { mailbox, credentials, aliases, accounts }
 }
 
+function mailboxFormatProvider(value: unknown): MailboxFormat['provider'] {
+  const normalized = text(value).trim().toLowerCase()
+  if (normalized === 'microsoft' || normalized === 'gmail' || normalized === 'cloudflare_route') return normalized
+  return undefined
+}
+
 function normalizeMailboxFormat(value: unknown): MailboxFormat | null {
   if (!isRecord(value)) return null
   const config = isRecord(value.config) ? value.config : value
@@ -460,7 +569,7 @@ function normalizeMailboxFormat(value: unknown): MailboxFormat | null {
     delimiter: text(value.delimiter ?? config.delimiter, ','),
     hasHeader: bool(value.has_header ?? value.hasHeader ?? config.has_header ?? config.hasHeader, true),
     fields: formatFields(value.fields ?? value.columns ?? config.fields ?? config.columns),
-    provider: optionalText(value.provider ?? config.provider),
+    provider: mailboxFormatProvider(value.provider ?? config.provider),
     template: optionalText(value.template ?? config.template),
     builtIn: bool(value.builtin ?? value.built_in ?? value.builtIn),
     enabled: bool(value.enabled, true),
@@ -912,30 +1021,41 @@ export const apiClient = {
     const type = text(payload.credential_type, credentialType)
     const methods = retrievalMethods(payload.retrieval_methods)
     const genericRefreshToken = optionalText(payload.refresh_token)
-    const explicitGraphRefreshToken = optionalText(payload.graph_refresh_token)
-    const explicitImapRefreshToken = optionalText(payload.imap_refresh_token)
-    const refreshToken = genericRefreshToken ?? explicitGraphRefreshToken ?? explicitImapRefreshToken
+    const refreshToken = genericRefreshToken
     if (!refreshToken || !type) throw new Error('凭据响应缺少令牌或类型')
-
-    const isDual = type === 'microsoft_dual_token'
-      || (methods.includes('microsoft_graph') && methods.includes('imap_oauth'))
-    const isLegacyDual = isDual
-      && !explicitGraphRefreshToken
-      && !explicitImapRefreshToken
     return {
       clientId: optionalText(payload.client_id),
       refreshToken,
-      graphRefreshToken: explicitGraphRefreshToken
-        ?? (type === 'microsoft_graph_oauth' || isLegacyDual ? genericRefreshToken : undefined),
-      imapRefreshToken: explicitImapRefreshToken
-        ?? (type === 'microsoft_imap_oauth' || isLegacyDual ? genericRefreshToken : undefined),
       credentialType: type,
       retrievalMethods: methods,
+      retrievalCapabilities: normalizeRetrievalCapabilities(payload.retrieval_capabilities),
+      refreshTokenValidity: (() => {
+        const validity = text(payload.refresh_token_validity)
+        return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+      })(),
       expiresAt: optionalText(payload.expires_at),
       graphTokenExpiresAt: optionalText(payload.graph_token_expires_at),
       imapTokenExpiresAt: optionalText(payload.imap_token_expires_at),
       revealedUntil: optionalText(payload.revealed_until),
     }
+  },
+
+  async getCachedMessages(mailbox: Pick<MailboxRecord, 'id' | 'parentId'>, folder: MessageFolder, signal?: AbortSignal): Promise<CachedMessagesResult> {
+    const base = mailbox.parentId
+      ? `/api/v1/mailbox-aliases/${encodeURIComponent(mailbox.id)}`
+      : `/api/v1/mailboxes/${encodeURIComponent(mailbox.id)}`
+    const response = await request<unknown>(`${base}/cached-messages?folder=${encodeURIComponent(folder)}&limit=100`, { signal })
+    return normalizeCachedMessagesResult(response)
+  },
+
+  async syncCachedMessages(mailbox: Pick<MailboxRecord, 'id' | 'parentId'>, folder: MessageFolder, method?: string): Promise<CachedMessagesResult> {
+    const base = mailbox.parentId
+      ? `/api/v1/mailbox-aliases/${encodeURIComponent(mailbox.id)}`
+      : `/api/v1/mailboxes/${encodeURIComponent(mailbox.id)}`
+    const query = new URLSearchParams({ folder, limit: '100' })
+    if (method) query.set('method', method)
+    const response = await request<unknown>(`${base}/messages/sync?${query.toString()}`, { method: 'POST' })
+    return normalizeCachedMessagesResult(response)
   },
 
   async getProviderConnections(signal?: AbortSignal): Promise<ProviderConnection[]> {
@@ -986,6 +1106,23 @@ export const apiClient = {
       }),
     })
     return normalizeTokenRefreshSettings(response)
+  },
+
+  async getMessageProbeSettings(signal?: AbortSignal): Promise<MessageProbeSettings> {
+    const response = await request<unknown>('/api/v1/settings/message-probe', { signal })
+    return normalizeMessageProbeSettings(response)
+  },
+
+  async saveMessageProbeSettings(input: SaveMessageProbeSettingsInput): Promise<MessageProbeSettings> {
+    const response = await request<unknown>('/api/v1/settings/message-probe', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: input.enabled,
+        interval_minutes: input.intervalMinutes,
+        version: input.version,
+      }),
+    })
+    return normalizeMessageProbeSettings(response)
   },
 
   async getMailboxFormats(signal?: AbortSignal): Promise<MailboxFormat[]> {

@@ -32,6 +32,8 @@ type Dependencies struct {
 	Formats              *service.FormatService
 	Transfers            *service.ImportExportService
 	Retrieval            *service.MessageRetrievalService
+	MessageCache         *service.MessageCacheService
+	MessageProbeSettings *service.MessageProbeSettingsService
 	ProviderConnections  *service.ProviderConnectionService
 	TokenRefreshSettings *service.TokenRefreshSettingsService
 	AdminToken           string
@@ -64,12 +66,22 @@ func NewRouter(deps Dependencies) (http.Handler, error) {
 		mux.HandleFunc("GET /api/v1/settings/token-refresh", h.getTokenRefreshSettings)
 		mux.HandleFunc("PUT /api/v1/settings/token-refresh", h.updateTokenRefreshSettings)
 	}
+	if deps.MessageProbeSettings != nil {
+		mux.HandleFunc("GET /api/v1/settings/message-probe", h.getMessageProbeSettings)
+		mux.HandleFunc("PUT /api/v1/settings/message-probe", h.updateMessageProbeSettings)
+	}
 	mux.HandleFunc("GET /api/v1/mailboxes", h.listMailboxes)
 	mux.HandleFunc("POST /api/v1/mailboxes", h.createMailbox)
 	mux.HandleFunc("GET /api/v1/mailboxes/overview", h.mailboxOverview)
 	mux.HandleFunc("GET /api/v1/mailboxes/{mailboxID}/detail", h.mailboxDetail)
 	mux.HandleFunc("GET /api/v1/mailboxes/{mailboxID}/messages", h.retrieveMailboxMessages)
 	mux.HandleFunc("GET /api/v1/mailbox-aliases/{aliasID}/messages", h.retrieveAliasMessages)
+	if deps.MessageCache != nil {
+		mux.HandleFunc("GET /api/v1/mailboxes/{mailboxID}/cached-messages", h.listMailboxCachedMessages)
+		mux.HandleFunc("POST /api/v1/mailboxes/{mailboxID}/messages/sync", h.syncMailboxMessages)
+		mux.HandleFunc("GET /api/v1/mailbox-aliases/{aliasID}/cached-messages", h.listAliasCachedMessages)
+		mux.HandleFunc("POST /api/v1/mailbox-aliases/{aliasID}/messages/sync", h.syncAliasMessages)
+	}
 	mux.HandleFunc("GET /api/v1/pickup/messages", h.retrievePickupMessages)
 	mux.HandleFunc("POST /api/v1/mailboxes/{mailboxID}/credentials/reveal", h.revealCredential)
 	mux.HandleFunc("POST /api/v1/mailboxes/import/preview", h.previewMailboxImport)
@@ -624,6 +636,7 @@ type overviewMailbox struct {
 	RetrievalKey      overviewRetrievalKey `json:"retrieval_key"`
 	Auth              overviewAuth         `json:"auth"`
 	Forwarding        *overviewForwarding  `json:"forwarding,omitempty"`
+	LastMessageAt     *time.Time           `json:"last_message_at,omitempty"`
 	CreatedAt         time.Time            `json:"created_at"`
 	Children          []overviewMailbox    `json:"children"`
 }
@@ -636,8 +649,12 @@ type overviewRetrievalKey struct {
 }
 
 type overviewAuth struct {
-	Modes       []string `json:"modes"`
-	AutoRefresh bool     `json:"auto_refresh"`
+	Modes                     []string   `json:"modes"`
+	AutoRefresh               bool       `json:"auto_refresh"`
+	RefreshStatus             string     `json:"refresh_status,omitempty"`
+	RefreshTokenValidity      string     `json:"refresh_token_validity,omitempty"`
+	GraphAccessTokenExpiresAt *time.Time `json:"graph_access_token_expires_at,omitempty"`
+	IMAPAccessTokenExpiresAt  *time.Time `json:"imap_access_token_expires_at,omitempty"`
 }
 
 type overviewForwarding struct {
@@ -669,6 +686,17 @@ func (h *handler) mailboxOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]overviewMailbox, 0, len(mailboxes))
 	for _, mailbox := range mailboxes {
+		summaries, err := h.deps.Details.Summaries(r.Context(), mailbox.ID, autoRefresh)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		mailboxAuth := overviewCredentialAuth(overviewProvider(mailbox.Provider), summaries)
+		lastMessageAt, err := h.overviewLastMessageAt(r.Context(), mailbox.ID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
 		aliases, err := h.listAllAliases(r.Context(), mailbox.ID)
 		if err != nil {
 			writeError(w, err)
@@ -682,11 +710,20 @@ func (h *handler) mailboxOverview(w http.ResponseWriter, r *http.Request) {
 		children := make([]overviewMailbox, 0, len(aliases))
 		for _, alias := range aliases {
 			provider := overviewProvider(alias.Provider)
+			aliasAuth := mailboxAuth
+			if alias.Kind == domain.AliasKindForward {
+				aliasAuth = overviewProviderAuth(provider, false)
+			}
+			aliasLastMessageAt, err := h.overviewLastMessageAt(r.Context(), alias.ID)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
 			child := overviewMailbox{
 				ID: alias.ID, ParentID: mailbox.ID, Kind: "split", Provider: provider,
 				Address: alias.Address, NormalizedAddress: alias.NormalizedAddress,
 				Status: mailbox.Status, RetrievalKey: pickupKeyOverview(keys),
-				Auth: overviewProviderAuth(provider, autoRefresh), CreatedAt: alias.CreatedAt, Children: []overviewMailbox{},
+				Auth: aliasAuth, LastMessageAt: aliasLastMessageAt, CreatedAt: alias.CreatedAt, Children: []overviewMailbox{},
 			}
 			if alias.Kind == domain.AliasKindForward {
 				child.Forwarding = &overviewForwarding{Target: mailbox.Address, Verified: false}
@@ -698,7 +735,7 @@ func (h *handler) mailboxOverview(w http.ResponseWriter, r *http.Request) {
 			ID: mailbox.ID, Kind: "primary", Provider: provider, Address: mailbox.Address,
 			NormalizedAddress: mailbox.NormalizedAddress, DisplayName: mailbox.DisplayName,
 			Status: mailbox.Status, RetrievalKey: pickupKeyOverview(keys),
-			Auth: overviewProviderAuth(provider, autoRefresh), CreatedAt: mailbox.CreatedAt, Children: children,
+			Auth: mailboxAuth, LastMessageAt: lastMessageAt, CreatedAt: mailbox.CreatedAt, Children: children,
 		})
 	}
 	targets, err := h.listAllBackupTargets(r.Context())
@@ -866,12 +903,60 @@ func overviewProvider(provider domain.ProviderKey) string {
 func overviewProviderAuth(provider string, autoRefresh bool) overviewAuth {
 	switch provider {
 	case "google":
-		return overviewAuth{Modes: []string{"oauth", "imap"}, AutoRefresh: autoRefresh}
+		return overviewAuth{Modes: []string{}, AutoRefresh: autoRefresh, RefreshStatus: "missing", RefreshTokenValidity: "missing"}
 	case "cloudflare":
-		return overviewAuth{Modes: []string{"forward"}, AutoRefresh: false}
+		return overviewAuth{Modes: []string{"forward"}, AutoRefresh: false, RefreshTokenValidity: "not_applicable"}
 	default:
-		return overviewAuth{Modes: []string{"graph", "imap"}, AutoRefresh: autoRefresh}
+		return overviewAuth{Modes: []string{}, AutoRefresh: autoRefresh, RefreshStatus: "missing", RefreshTokenValidity: "missing"}
 	}
+}
+
+func overviewCredentialAuth(provider string, summaries []service.CredentialSummary) overviewAuth {
+	if provider == "cloudflare" {
+		return overviewProviderAuth(provider, false)
+	}
+	result := overviewProviderAuth(provider, false)
+	seenModes := make(map[string]struct{})
+	for _, summary := range summaries {
+		for _, method := range summary.RetrievalMethods {
+			mode := ""
+			switch method {
+			case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
+				mode = "graph"
+			case domain.RetrievalIMAPOAuth, domain.RetrievalIMAPPassword:
+				mode = "imap"
+			case domain.RetrievalGmailAPI:
+				mode = "oauth"
+			}
+			if mode != "" {
+				seenModes[mode] = struct{}{}
+			}
+		}
+		result.AutoRefresh = result.AutoRefresh || summary.AutoRefresh
+		if result.RefreshStatus == "missing" || result.RefreshStatus == "" {
+			result.RefreshStatus = summary.RefreshStatus
+			result.RefreshTokenValidity = summary.RefreshTokenValidity
+		}
+		if summary.GraphTokenExpiresAt != nil {
+			result.GraphAccessTokenExpiresAt = summary.GraphTokenExpiresAt
+		}
+		if summary.IMAPTokenExpiresAt != nil {
+			result.IMAPAccessTokenExpiresAt = summary.IMAPTokenExpiresAt
+		}
+	}
+	for _, mode := range []string{"graph", "oauth", "imap"} {
+		if _, exists := seenModes[mode]; exists {
+			result.Modes = append(result.Modes, mode)
+		}
+	}
+	return result
+}
+
+func (h *handler) overviewLastMessageAt(ctx context.Context, targetID string) (*time.Time, error) {
+	if h.deps.MessageCache == nil {
+		return nil, nil
+	}
+	return h.deps.MessageCache.LastMessageAt(ctx, targetID)
 }
 
 func pickupKeyOverview(keys []domain.MailboxPickupKey) overviewRetrievalKey {

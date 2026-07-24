@@ -56,6 +56,12 @@ type retrievalTestRegistry struct {
 	registration ports.ProviderRegistration
 }
 
+type retrievalRefreshSettingsFunc func(context.Context) (service.TokenRefreshSettings, error)
+
+func (f retrievalRefreshSettingsFunc) Get(ctx context.Context) (service.TokenRefreshSettings, error) {
+	return f(ctx)
+}
+
 func (r retrievalTestRegistry) Register(ports.ProviderRegistration) error { return domain.ErrConflict }
 
 func (r retrievalTestRegistry) Get(key domain.ProviderKey) (ports.ProviderRegistration, error) {
@@ -224,6 +230,53 @@ func TestMessageRetrievalRefreshesAfterRetrieverReportsMissingAccessToken(t *tes
 	}
 	if stored.Version != 2 || string(stored.EncryptedSecret) != "credential-with-at" {
 		t.Fatalf("stored credential = %+v", stored)
+	}
+}
+
+func TestMessageRetrievalDoesNotRefreshWhenSettingIsDisabled(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 24, 13, 45, 0, 0, time.UTC)
+	store, mailbox := createRetrievalMailbox(t, now)
+	expired := now.Add(-time.Minute)
+	createRetrievalCredential(t, store, mailbox.ID, domain.CredentialMicrosoftDualToken, "existing-sealed-secret", expired, now)
+	var retrieveCalls atomic.Int32
+	var refreshCalls atomic.Int32
+	retriever := &retrievalTestRetriever{
+		methods: []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth},
+		retrieve: func(context.Context, domain.Mailbox, domain.MailboxCredential, domain.MessageQuery) ([]domain.Message, error) {
+			retrieveCalls.Add(1)
+			return nil, fmt.Errorf("%w: access token expired", domain.ErrUnauthorized)
+		},
+		refresh: func(context.Context, domain.Mailbox, domain.MailboxCredential) (domain.RefreshedCredential, error) {
+			refreshCalls.Add(1)
+			return domain.RefreshedCredential{}, nil
+		},
+	}
+	retrieval := newRetrievalService(t, store, mailbox.Provider, retriever, now)
+	retrieval.SetSettingsReader(retrievalRefreshSettingsFunc(func(context.Context) (service.TokenRefreshSettings, error) {
+		return service.TokenRefreshSettings{Enabled: false}, nil
+	}))
+
+	_, err := retrieval.Retrieve(ctx, servicepkgInput(mailbox.ID, "", domain.MessageQuery{}))
+	if !errors.Is(err, domain.ErrUnauthorized) {
+		t.Fatalf("retrieve error = %v, want unauthorized", err)
+	}
+	if retrieveCalls.Load() != 1 || refreshCalls.Load() != 0 {
+		t.Fatalf("retrieve calls=%d refresh calls=%d", retrieveCalls.Load(), refreshCalls.Load())
+	}
+	stored, err := store.GetCredential(ctx, mailbox.ID, domain.CredentialMicrosoftDualToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Version != 1 || string(stored.EncryptedSecret) != "existing-sealed-secret" {
+		t.Fatalf("disabled refresh changed credential = %+v", stored)
+	}
+	returned, err := retrieval.RefreshDueCredential(ctx, mailbox.ID, domain.CredentialMicrosoftDualToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned.Version != 1 || refreshCalls.Load() != 0 {
+		t.Fatalf("due refresh returned=%+v calls=%d", returned, refreshCalls.Load())
 	}
 }
 
@@ -443,6 +496,9 @@ func newRetrievalService(t *testing.T, store *memory.Store, providerKey domain.P
 		t.Fatal(err)
 	}
 	result.SetClock(func() time.Time { return now })
+	result.SetSettingsReader(retrievalRefreshSettingsFunc(func(context.Context) (service.TokenRefreshSettings, error) {
+		return service.TokenRefreshSettings{Enabled: true}, nil
+	}))
 	return result
 }
 

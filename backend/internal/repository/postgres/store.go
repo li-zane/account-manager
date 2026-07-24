@@ -201,15 +201,16 @@ func (s *Store) ListCredentials(ctx context.Context, mailboxID string) ([]domain
 func (s *Store) CreatePickupKey(ctx context.Context, key domain.MailboxPickupKey) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO mailbox_pickup_keys
-			(id, mailbox_id, digest, prefix, label, expires_at, revoked_at, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		key.ID, key.MailboxID, key.Digest, key.Prefix, key.Label, key.ExpiresAt, key.RevokedAt, key.CreatedAt)
+			(id, mailbox_id, digest, encrypted_token, key_version, prefix, label, expires_at, revoked_at, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		key.ID, key.MailboxID, key.Digest, nullableBytes(key.EncryptedToken), nullableText(key.KeyVersion),
+		key.Prefix, key.Label, key.ExpiresAt, key.RevokedAt, key.CreatedAt)
 	return mapError(err)
 }
 
 func (s *Store) FindPickupKeyByDigest(ctx context.Context, digest []byte) (domain.MailboxPickupKey, error) {
 	return scanPickupKey(s.pool.QueryRow(ctx, `
-		SELECT id, mailbox_id, digest, prefix, label, expires_at, revoked_at, created_at
+		SELECT id, mailbox_id, digest, COALESCE(encrypted_token, ''::bytea), COALESCE(key_version, ''), prefix, label, expires_at, revoked_at, created_at
 		FROM mailbox_pickup_keys WHERE digest=$1`, digest))
 }
 
@@ -229,7 +230,7 @@ func (s *Store) RevokePickupKey(ctx context.Context, mailboxID, keyID string) er
 func (s *Store) ListPickupKeys(ctx context.Context, mailboxID string, options ports.ListOptions) ([]domain.MailboxPickupKey, error) {
 	options = options.Normalize(100, 500)
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, mailbox_id, digest, prefix, label, expires_at, revoked_at, created_at
+		SELECT id, mailbox_id, digest, COALESCE(encrypted_token, ''::bytea), COALESCE(key_version, ''), prefix, label, expires_at, revoked_at, created_at
 		FROM mailbox_pickup_keys WHERE mailbox_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		mailboxID, options.Limit, options.Offset)
 	if err != nil {
@@ -583,7 +584,7 @@ func scanCredential(row scanner) (domain.MailboxCredential, error) {
 
 func scanPickupKey(row scanner) (domain.MailboxPickupKey, error) {
 	var item domain.MailboxPickupKey
-	err := row.Scan(&item.ID, &item.MailboxID, &item.Digest, &item.Prefix, &item.Label,
+	err := row.Scan(&item.ID, &item.MailboxID, &item.Digest, &item.EncryptedToken, &item.KeyVersion, &item.Prefix, &item.Label,
 		&item.ExpiresAt, &item.RevokedAt, &item.CreatedAt)
 	return item, mapError(err)
 }
@@ -626,6 +627,13 @@ func validJSON(value json.RawMessage) json.RawMessage {
 
 func nullableText(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableBytes(value []byte) any {
+	if len(value) == 0 {
 		return nil
 	}
 	return value

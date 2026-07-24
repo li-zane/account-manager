@@ -33,6 +33,7 @@ type MessageRetrievalService struct {
 	mailboxes ports.MailboxRepository
 	providers ports.ProviderRegistry
 	matches   RecipientMatcher
+	settings  CredentialRefreshSettingsReader
 	clock     func() time.Time
 
 	refreshLocksMu sync.Mutex
@@ -61,6 +62,12 @@ func (s *MessageRetrievalService) SetClock(clock func() time.Time) {
 	if clock != nil {
 		s.clock = clock
 	}
+}
+
+// SetSettingsReader installs the runtime refresh switch. Refreshing is
+// fail-closed when no reader is configured or when the setting is disabled.
+func (s *MessageRetrievalService) SetSettingsReader(settings CredentialRefreshSettingsReader) {
+	s.settings = settings
 }
 
 func (s *MessageRetrievalService) Retrieve(ctx context.Context, input RetrieveMessagesInput) ([]domain.Message, error) {
@@ -102,12 +109,16 @@ func (s *MessageRetrievalService) Retrieve(ctx context.Context, input RetrieveMe
 	}
 	query.RetrievalMethod = method
 
-	credential, err = s.ensureFreshCredential(ctx, mailbox, registration.Retriever, credential)
+	refreshEnabled, err := s.refreshEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	credential, err = s.ensureFreshCredential(ctx, mailbox, registration.Retriever, credential, refreshEnabled)
 	if err != nil {
 		return nil, err
 	}
 	messages, err := registration.Retriever.Retrieve(ctx, mailbox, credential, query)
-	if err != nil && errors.Is(err, domain.ErrUnauthorized) && refreshableCredential(credential.Kind) {
+	if err != nil && refreshEnabled && errors.Is(err, domain.ErrUnauthorized) && refreshableCredential(credential.Kind) {
 		credential, err = s.refreshCredential(ctx, mailbox, registration.Retriever, credential, true)
 		if err != nil {
 			return nil, err
@@ -140,6 +151,13 @@ func (s *MessageRetrievalService) RefreshDueCredential(ctx context.Context, mail
 	}
 	if !refreshableCredential(kind) {
 		return domain.MailboxCredential{}, fmt.Errorf("%w: credential kind %q does not support refresh", domain.ErrInvalid, kind)
+	}
+	refreshEnabled, err := s.refreshEnabled(ctx)
+	if err != nil {
+		return domain.MailboxCredential{}, err
+	}
+	if !refreshEnabled {
+		return s.mailboxes.GetCredential(ctx, mailboxID, kind)
 	}
 	mailbox, err := s.mailboxes.GetMailbox(ctx, mailboxID)
 	if err != nil {
@@ -214,7 +232,7 @@ func selectRetrievalCredential(credentials []domain.MailboxCredential, methods [
 
 func credentialKindsForMethod(method domain.RetrievalMethod) []domain.CredentialKind {
 	switch method {
-	case domain.RetrievalMicrosoftGraph:
+	case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
 		return []domain.CredentialKind{domain.CredentialMicrosoftGraphOAuth, domain.CredentialMicrosoftDualToken}
 	case domain.RetrievalIMAPOAuth:
 		return []domain.CredentialKind{domain.CredentialMicrosoftIMAPOAuth, domain.CredentialMicrosoftDualToken}
@@ -251,11 +269,22 @@ func containsRetrievalMethod(methods []domain.RetrievalMethod, target domain.Ret
 	return false
 }
 
-func (s *MessageRetrievalService) ensureFreshCredential(ctx context.Context, mailbox domain.Mailbox, retriever ports.MailRetriever, credential domain.MailboxCredential) (domain.MailboxCredential, error) {
-	if !credentialNeedsRefresh(credential, s.clock().UTC()) {
+func (s *MessageRetrievalService) ensureFreshCredential(ctx context.Context, mailbox domain.Mailbox, retriever ports.MailRetriever, credential domain.MailboxCredential, refreshEnabled bool) (domain.MailboxCredential, error) {
+	if !refreshEnabled || !credentialNeedsRefresh(credential, s.clock().UTC()) {
 		return credential, nil
 	}
 	return s.refreshCredential(ctx, mailbox, retriever, credential, false)
+}
+
+func (s *MessageRetrievalService) refreshEnabled(ctx context.Context) (bool, error) {
+	if s.settings == nil {
+		return false, nil
+	}
+	settings, err := s.settings.Get(ctx)
+	if err != nil {
+		return false, fmt.Errorf("read token refresh setting: %w", err)
+	}
+	return settings.Enabled, nil
 }
 
 func (s *MessageRetrievalService) refreshCredential(ctx context.Context, mailbox domain.Mailbox, retriever ports.MailRetriever, observed domain.MailboxCredential, force bool) (domain.MailboxCredential, error) {

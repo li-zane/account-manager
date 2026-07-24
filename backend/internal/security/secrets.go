@@ -8,9 +8,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/li-zane/account-manager/backend/internal/domain"
@@ -80,13 +82,19 @@ func (b *AESGCMBroker) Open(_ context.Context, sealed []byte, keyVersion string)
 
 var _ ports.SecretBroker = (*AESGCMBroker)(nil)
 
-// PickupKeyService turns a raw platform token into a one-time displayed secret
-// and stores only a keyed digest. The server pepper makes database-only leaks
-// insufficient to validate arbitrary tokens.
+// PickupKeyService always stores a keyed digest for lookup. When a secret
+// broker is configured it also stores an encrypted copy that is available only
+// to explicit administrator reveal/export operations.
 type PickupKeyService struct {
-	repository ports.PickupKeyRepository
-	pepper     []byte
-	clock      func() time.Time
+	repository  ports.PickupKeyRepository
+	secrets     ports.SecretBroker
+	pepper      []byte
+	clock       func() time.Time
+	ensureLocks sync.Map
+}
+
+func (s *PickupKeyService) SetSecretBroker(secrets ports.SecretBroker) {
+	s.secrets = secrets
 }
 
 func NewPickupKeyService(repository ports.PickupKeyRepository, pepper []byte) (*PickupKeyService, error) {
@@ -134,6 +142,13 @@ func (s *PickupKeyService) Issue(ctx context.Context, mailboxID, label string, e
 		ID: id, MailboxID: mailboxID, Digest: digest, Prefix: prefix,
 		Label: label, ExpiresAt: expiresAt, CreatedAt: s.clock().UTC(),
 	}
+	if s.secrets != nil {
+		sealed, keyVersion, err := s.secrets.Seal(ctx, []byte(token))
+		if err != nil {
+			return domain.MailboxPickupKey{}, "", fmt.Errorf("seal pickup key: %w", err)
+		}
+		key.EncryptedToken, key.KeyVersion = sealed, keyVersion
+	}
 	if err := s.repository.CreatePickupKey(ctx, key); err != nil {
 		return domain.MailboxPickupKey{}, "", err
 	}
@@ -144,6 +159,12 @@ func (s *PickupKeyService) Issue(ctx context.Context, mailboxID, label string, e
 // digest used by newly issued platform keys. Persistence is left to the
 // mailbox import transaction so the raw value never crosses into a repository.
 func (s *PickupKeyService) PrepareImported(mailboxID, label, token string) (domain.MailboxPickupKey, error) {
+	return s.PrepareImportedKey(context.Background(), mailboxID, label, token)
+}
+
+// PrepareImportedKey preserves the digest lookup contract and, when a secret
+// broker is configured, also prepares a recoverable ciphertext for exports.
+func (s *PickupKeyService) PrepareImportedKey(ctx context.Context, mailboxID, label, token string) (domain.MailboxPickupKey, error) {
 	mailboxID = strings.TrimSpace(mailboxID)
 	token = strings.TrimSpace(token)
 	if mailboxID == "" || token == "" {
@@ -156,10 +177,75 @@ func (s *PickupKeyService) PrepareImported(mailboxID, label, token string) (doma
 	if strings.TrimSpace(label) == "" {
 		label = "legacy import"
 	}
-	return domain.MailboxPickupKey{
+	key := domain.MailboxPickupKey{
 		ID: "pkey_" + base64.RawURLEncoding.EncodeToString(idRaw), MailboxID: mailboxID,
 		Digest: s.digest(token), Prefix: "legacy", Label: strings.TrimSpace(label), CreatedAt: s.clock().UTC(),
-	}, nil
+	}
+	if s.secrets != nil {
+		sealed, keyVersion, err := s.secrets.Seal(ctx, []byte(token))
+		if err != nil {
+			return domain.MailboxPickupKey{}, fmt.Errorf("seal imported pickup key: %w", err)
+		}
+		key.EncryptedToken, key.KeyVersion = sealed, keyVersion
+	}
+	return key, nil
+}
+
+// Ensure creates an exportable automatic key only when the mailbox has no
+// active encrypted key. Existing digest-only keys remain valid for lookup.
+func (s *PickupKeyService) Ensure(ctx context.Context, mailboxID string) (domain.MailboxPickupKey, error) {
+	if s.secrets == nil {
+		return domain.MailboxPickupKey{}, fmt.Errorf("%w: pickup key secret broker", domain.ErrNotConfigured)
+	}
+	mailboxID = strings.TrimSpace(mailboxID)
+	if mailboxID == "" {
+		return domain.MailboxPickupKey{}, fmt.Errorf("%w: mailbox id is required", domain.ErrInvalid)
+	}
+	lockValue, _ := s.ensureLocks.LoadOrStore(mailboxID, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	items, err := s.List(ctx, mailboxID, ports.ListOptions{Limit: 500})
+	if err != nil {
+		return domain.MailboxPickupKey{}, err
+	}
+	now := s.clock().UTC()
+	if item, ok := activeExportablePickupKey(items, now); ok {
+		return item, nil
+	}
+	key, _, err := s.Issue(ctx, mailboxID, "automatic", nil)
+	if errors.Is(err, domain.ErrConflict) {
+		items, listErr := s.List(ctx, mailboxID, ports.ListOptions{Limit: 500})
+		if listErr == nil {
+			if item, ok := activeExportablePickupKey(items, now); ok {
+				return item, nil
+			}
+		}
+	}
+	return key, err
+}
+
+func activeExportablePickupKey(items []domain.MailboxPickupKey, now time.Time) (domain.MailboxPickupKey, bool) {
+	for _, item := range items {
+		if item.RevokedAt == nil && (item.ExpiresAt == nil || item.ExpiresAt.After(now)) && len(item.EncryptedToken) > 0 && item.KeyVersion != "" {
+			return item, true
+		}
+	}
+	return domain.MailboxPickupKey{}, false
+}
+
+func (s *PickupKeyService) Reveal(ctx context.Context, mailboxID string) (string, error) {
+	key, err := s.Ensure(ctx, mailboxID)
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := s.secrets.Open(ctx, key.EncryptedToken, key.KeyVersion)
+	if err != nil {
+		return "", fmt.Errorf("open pickup key: %w", err)
+	}
+	defer clear(plaintext)
+	return string(plaintext), nil
 }
 
 func (s *PickupKeyService) Lookup(ctx context.Context, token string) (domain.MailboxPickupKey, error) {

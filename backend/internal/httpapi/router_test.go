@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/li-zane/account-manager/backend/internal/domain"
 	"github.com/li-zane/account-manager/backend/internal/httpapi"
@@ -83,6 +84,19 @@ func TestMailboxOverviewAndBackupCompatibilityFlow(t *testing.T) {
 
 	mailboxResponse := requestJSON(t, router, http.MethodPost, "/api/v1/mailboxes", `{"provider":"gmail","address":"Owner@Gmail.com"}`, http.StatusCreated)
 	mailboxID := nestedString(t, mailboxResponse, "id")
+	credentialPayload, _ := json.Marshal(domain.MailboxCredentialSecret{ClientID: "fixture-client", RefreshToken: "fixture-refresh"})
+	sealedCredential, credentialKeyVersion, err := broker.Seal(context.Background(), credentialPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpsertCredential(context.Background(), domain.MailboxCredential{
+		ID: "cred_http_overview", MailboxID: mailboxID, Kind: domain.CredentialGmailOAuth,
+		ClientID: "fixture-client", EncryptedSecret: sealedCredential, KeyVersion: credentialKeyVersion,
+		RefreshStatus: "active", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	requestJSON(t, router, http.MethodPost, "/api/v1/mailboxes/"+mailboxID+"/aliases", `{"provider":"cloudflare_route","address":"chat@example.net","kind":"forward"}`, http.StatusCreated)
 	keyResponse := requestJSON(t, router, http.MethodPost, "/api/v1/mailboxes/"+mailboxID+"/pickup-keys", `{"label":"reader"}`, http.StatusCreated)
 	token := nestedString(t, keyResponse, "token")
@@ -103,6 +117,9 @@ func TestMailboxOverviewAndBackupCompatibilityFlow(t *testing.T) {
 	}
 	if mailbox["auth"].(map[string]any)["auto_refresh"] != true {
 		t.Fatalf("managed mailbox auto refresh = %+v, want persisted default enabled", mailbox["auth"])
+	}
+	if mailbox["auth"].(map[string]any)["refresh_token_validity"] != "no_fixed_expiry" {
+		t.Fatalf("managed mailbox RT validity = %+v", mailbox["auth"])
 	}
 	children := mailbox["children"].([]any)
 	if len(children) != 1 || children[0].(map[string]any)["provider"] != "cloudflare" {

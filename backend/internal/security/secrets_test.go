@@ -2,6 +2,7 @@ package security
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,8 +39,14 @@ func (r *pickupMemoryRepository) RevokePickupKey(_ context.Context, mailboxID, k
 	return domain.ErrNotFound
 }
 
-func (r *pickupMemoryRepository) ListPickupKeys(context.Context, string, ports.ListOptions) ([]domain.MailboxPickupKey, error) {
-	return nil, nil
+func (r *pickupMemoryRepository) ListPickupKeys(_ context.Context, mailboxID string, _ ports.ListOptions) ([]domain.MailboxPickupKey, error) {
+	items := make([]domain.MailboxPickupKey, 0, len(r.items))
+	for _, item := range r.items {
+		if mailboxID == "" || item.MailboxID == mailboxID {
+			items = append(items, item)
+		}
+	}
+	return items, nil
 }
 
 func TestAESGCMBrokerRoundTripAndVersion(t *testing.T) {
@@ -115,5 +122,85 @@ func TestPrepareImportedPickupKeyKeepsLegacyValueOutOfPersistence(t *testing.T) 
 	}
 	if resolved.ID != key.ID || resolved.MailboxID != "mbx_cloudflare_demo" {
 		t.Fatalf("resolved imported key = %+v", resolved)
+	}
+}
+
+func TestPickupKeyEnsureIsIdempotentAndEncryptedRevealRemainsUsable(t *testing.T) {
+	ctx := context.Background()
+	repository := &pickupMemoryRepository{items: make(map[string]domain.MailboxPickupKey)}
+	service, err := NewPickupKeyService(repository, []byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewAESGCMBroker([]byte("abcdefghijklmnopqrstuvwxyz123456"), "pickup-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetSecretBroker(broker)
+	first, err := service.Ensure(ctx, "mbx_auto_pickup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Ensure(ctx, "mbx_auto_pickup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID || len(repository.items) != 1 {
+		t.Fatalf("Ensure issued duplicate keys: first=%q second=%q count=%d", first.ID, second.ID, len(repository.items))
+	}
+	if len(first.EncryptedToken) == 0 || first.KeyVersion != "pickup-v1" {
+		t.Fatalf("automatic key is not exportable: %+v", first)
+	}
+	raw, err := service.Reveal(ctx, "mbx_auto_pickup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := service.Lookup(ctx, raw)
+	if err != nil || resolved.ID != first.ID {
+		t.Fatalf("revealed key lookup = %+v, err=%v", resolved, err)
+	}
+}
+
+func TestPickupKeyEnsureCoalescesConcurrentIssuance(t *testing.T) {
+	ctx := context.Background()
+	repository := &pickupMemoryRepository{items: make(map[string]domain.MailboxPickupKey)}
+	service, err := NewPickupKeyService(repository, []byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewAESGCMBroker([]byte("abcdefghijklmnopqrstuvwxyz123456"), "pickup-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetSecretBroker(broker)
+
+	const workers = 32
+	var group sync.WaitGroup
+	errorsByWorker := make(chan error, workers)
+	ids := make(chan string, workers)
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			key, ensureErr := service.Ensure(ctx, "mbx_concurrent_pickup")
+			if ensureErr != nil {
+				errorsByWorker <- ensureErr
+				return
+			}
+			ids <- key.ID
+		}()
+	}
+	group.Wait()
+	close(errorsByWorker)
+	close(ids)
+	for ensureErr := range errorsByWorker {
+		t.Fatal(ensureErr)
+	}
+	unique := make(map[string]struct{})
+	for id := range ids {
+		unique[id] = struct{}{}
+	}
+	if len(unique) != 1 || len(repository.items) != 1 {
+		t.Fatalf("concurrent Ensure produced ids=%d keys=%d", len(unique), len(repository.items))
 	}
 }

@@ -226,6 +226,15 @@ func builtinFormats(now time.Time) []domain.MailboxFormat {
 	cloudflareRoute := domain.ProviderCloudflareRoute
 	return []domain.MailboxFormat{
 		{
+			ID: "fmt_builtin_pickup2", Name: "Email and platform pickup key", Kind: domain.MailboxFormatDelimited,
+			Direction: domain.MailboxFormatBoth, Delimiter: "----", Enabled: true, Builtin: true, Version: 1,
+			Fields: []domain.MailboxFormatField{
+				{Column: "email", Target: "address", Required: true},
+				{Column: "pickup_key", Target: "pickup_key", Required: true, Sensitive: true},
+			},
+			ParserConfig: json.RawMessage(`{"provider_from_address":true}`), CreatedAt: now, UpdatedAt: now,
+		},
+		{
 			ID: "fmt_builtin_outlook4", Name: "Outlook 4-part", Kind: domain.MailboxFormatDelimited,
 			Direction: domain.MailboxFormatBoth, Delimiter: "----", Provider: &microsoft, Enabled: true, Builtin: true, Version: 1,
 			Fields: []domain.MailboxFormatField{
@@ -234,7 +243,7 @@ func builtinFormats(now time.Time) []domain.MailboxFormat {
 				{Column: "client_id", Target: "client_id"},
 				{Column: "refresh_token", Target: "refresh_token", Sensitive: true},
 			},
-			ParserConfig: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now,
+			ParserConfig: json.RawMessage(`{"credential_kind":"microsoft_dual_token"}`), CreatedAt: now, UpdatedAt: now,
 		},
 		{
 			ID: "fmt_builtin_registered6", Name: "Registered 6-part", Kind: domain.MailboxFormatDelimited,

@@ -7,6 +7,7 @@ import (
 
 const (
 	AppSettingKeyTokenRefresh    = "mailbox.token_refresh"
+	AppSettingKeyMessageProbe    = "mailbox.message_probe"
 	AppSettingKeyBackupScheduler = "backup.scheduler"
 )
 

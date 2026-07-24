@@ -18,6 +18,7 @@ import (
 type transferFixture struct {
 	store    *memory.Store
 	broker   *security.AESGCMBroker
+	pickup   *security.PickupKeyService
 	transfer *service.ImportExportService
 }
 
@@ -46,7 +47,14 @@ func newTransferFixture(t *testing.T) transferFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return transferFixture{store: store, broker: broker, transfer: transfer}
+	pickup, err := security.NewPickupKeyService(store, []byte("abcdefghijklmnopqrstuvwxyz123456"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pickup.SetSecretBroker(broker)
+	transfer.SetPickupKeyPreparer(pickup)
+	transfer.SetPickupKeyExporter(pickup)
+	return transferFixture{store: store, broker: broker, pickup: pickup, transfer: transfer}
 }
 
 func TestRegisteredSixPartImportKeepsMailboxAndPlatformSecretsSeparate(t *testing.T) {
@@ -166,6 +174,45 @@ func TestImportConflictStrategiesAndSensitiveExport(t *testing.T) {
 	}
 	if !sensitive.SensitiveIncluded || !strings.Contains(sensitive.Content, "updated-password") || !strings.Contains(sensitive.Content, "refresh-updated") {
 		t.Fatalf("authorized export = %+v", sensitive)
+	}
+}
+
+func TestImportedMailboxGetsAutomaticPickupKeyAndUniversalSensitiveExport(t *testing.T) {
+	fixture := newTransferFixture(t)
+	ctx := context.Background()
+	result, err := fixture.transfer.Import(ctx, service.MailboxImportRequest{
+		FormatID:         "fmt_builtin_outlook4",
+		Data:             "pickup@example.com----mail-password----client-id----shared-refresh-token",
+		ConflictStrategy: domain.ConflictSkip,
+	})
+	if err != nil || result.Created != 1 || len(result.MailboxIDs) != 1 {
+		t.Fatalf("import result = %+v, err=%v", result, err)
+	}
+	keys, err := fixture.pickup.List(ctx, result.MailboxIDs[0], ports.ListOptions{Limit: 10})
+	if err != nil || len(keys) != 1 || len(keys[0].EncryptedToken) == 0 {
+		t.Fatalf("automatic pickup keys = %+v, err=%v", keys, err)
+	}
+	redacted, err := fixture.transfer.Export(ctx, service.MailboxExportRequest{
+		FormatID: "fmt_builtin_pickup2", MailboxIDs: result.MailboxIDs,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redacted.Content != "pickup@example.com----" || redacted.SensitiveIncluded {
+		t.Fatalf("redacted pickup export = %+v", redacted)
+	}
+	exported, err := fixture.transfer.Export(ctx, service.MailboxExportRequest{
+		FormatID: "fmt_builtin_pickup2", MailboxIDs: result.MailboxIDs, IncludeSensitive: true,
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(exported.Content, "----")
+	if len(parts) != 2 || parts[0] != "pickup@example.com" || !strings.HasPrefix(parts[1], "am_pk_") || !exported.SensitiveIncluded {
+		t.Fatalf("sensitive pickup export = %+v", exported)
+	}
+	if _, err := fixture.pickup.Lookup(ctx, parts[1]); err != nil {
+		t.Fatalf("exported pickup key is not usable: %v", err)
 	}
 }
 
@@ -431,7 +478,7 @@ func gmailIMAPConnectionTransferFormat() domain.MailboxFormat {
 
 func assertMailboxRefreshToken(t *testing.T, fixture transferFixture, mailboxID, expected string) {
 	t.Helper()
-	credential, err := fixture.store.GetCredential(context.Background(), mailboxID, domain.CredentialMicrosoftGraphOAuth)
+	credential, err := fixture.store.GetCredential(context.Background(), mailboxID, domain.CredentialMicrosoftDualToken)
 	if err != nil {
 		t.Fatal(err)
 	}

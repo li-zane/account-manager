@@ -32,6 +32,8 @@ type Store struct {
 	credentials         map[string]domain.MailboxCredential
 	pickupKeys          map[string]domain.MailboxPickupKey
 	pickupByDigest      map[string]string
+	cachedMessages      map[string]domain.CachedMessage
+	messageSyncStates   map[string]domain.MessageSyncState
 	accounts            map[string]domain.PlatformAccount
 	platformCredentials map[string]domain.PlatformAccountCredential
 	formats             map[string]domain.MailboxFormat
@@ -53,6 +55,10 @@ func New() *Store {
 				Key: domain.AppSettingKeyBackupScheduler, Value: json.RawMessage(`{"enabled":false,"max_parallel_runs":1}`),
 				Version: 1, UpdatedAt: now,
 			},
+			domain.AppSettingKeyMessageProbe: {
+				Key: domain.AppSettingKeyMessageProbe, Value: json.RawMessage(`{"enabled":false,"interval_minutes":10}`),
+				Version: 1, UpdatedAt: now,
+			},
 		},
 		mailboxes:           make(map[string]domain.Mailbox),
 		mailboxByIdentity:   make(map[string]string),
@@ -61,6 +67,8 @@ func New() *Store {
 		credentials:         make(map[string]domain.MailboxCredential),
 		pickupKeys:          make(map[string]domain.MailboxPickupKey),
 		pickupByDigest:      make(map[string]string),
+		cachedMessages:      make(map[string]domain.CachedMessage),
+		messageSyncStates:   make(map[string]domain.MessageSyncState),
 		accounts:            make(map[string]domain.PlatformAccount),
 		platformCredentials: make(map[string]domain.PlatformAccountCredential),
 		formats:             make(map[string]domain.MailboxFormat),
@@ -1144,6 +1152,7 @@ func clonePlatformCredential(value domain.PlatformAccountCredential) domain.Plat
 
 func clonePickupKey(value domain.MailboxPickupKey) domain.MailboxPickupKey {
 	value.Digest = cloneBytes(value.Digest)
+	value.EncryptedToken = cloneBytes(value.EncryptedToken)
 	value.ExpiresAt = cloneTime(value.ExpiresAt)
 	value.RevokedAt = cloneTime(value.RevokedAt)
 	return value

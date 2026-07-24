@@ -27,7 +27,7 @@
 ### Mail retrieval and credentials
 
 - Implemented Microsoft Graph and Outlook IMAP retrieval, Gmail API and IMAP retrieval, refresh-token rotation, pagination bounds, folder/query mapping, and redacted upstream errors.
-- Implemented separate Graph/IMAP token fields plus legacy shared-token compatibility. Shared dual refresh runs Graph first, persists a rotated-token checkpoint, then runs IMAP with the current chain token.
+- Implemented one canonical Microsoft RT shared by Graph/REST and IMAP, with read compatibility for legacy split-token fields. Dual-channel refresh runs Graph first, persists a rotated-token checkpoint, then runs IMAP with the current chain token.
 - Added persisted token-refresh settings (`enabled`, lead time, version) and a worker that reloads them each pass, paginates mailbox scans, bounds concurrency and per-item time, backs off errors, and coalesces concurrent on-demand refreshes.
 - Added administrator and platform pickup-key retrieval endpoints. Pickup keys are HMAC-digested, scoped to one mailbox, revocable/expirable, and may select only aliases belonging to that mailbox.
 - Enforced fail-closed alias filtering against exact normalized recipients from provider-native recipient fields and accepted envelope/original-recipient headers. A parent mailbox match alone is insufficient.
@@ -39,7 +39,15 @@
 - Added built-in legacy formats for Outlook four-part, registered six-part, Cloudflare-routed three-part, and simple three-part records. The simple format infers Microsoft/Gmail only from recognized address domains and reports unknown domains explicitly.
 - Added custom delimited, JSON, and reversible template import/export. Templates support single-line, multiline, JSON-encoded variables, and one repeat block with a declared separator.
 - Cloudflare-routed legacy access keys are imported directly as pickup-key HMAC digests. The plaintext is not retained, the format is import-only, and the value is not reconstructable during export.
-- Added mailbox details with credential type, client ID, per-method token presence/expiry, masked RT fields, explicit reveal, aliases, and linked platform accounts.
+- Added mailbox details with credential type, client ID, one masked shared RT, per-channel capability state and AT expiry, explicit reveal, aliases, and linked platform accounts.
+- Added automatic encrypted pickup-key issuance and per-mailbox export. Universal export supports `邮箱----本站取件密钥`, while Microsoft-only exports retain the Outlook four-part format.
+- Serialized automatic pickup-key issuance per mailbox and added a PostgreSQL partial unique index so concurrent server instances converge on one active encrypted automatic key.
+
+### Cached mailbox viewing
+
+- Added persisted INBOX/Junk caching with mailbox/alias-specific incremental cursors, deduplication, exact alias-recipient filtering, manual synchronization, and optional scheduled probing.
+- Added an inbox dialog with Graph/IMAP channel selection, fast folder switching, local sender/subject/recipient/body search, cached and matched counts, and synchronization state.
+- Made the mailbox address itself copyable and retained the explicit row copy action.
 
 ### Backup and restore
 

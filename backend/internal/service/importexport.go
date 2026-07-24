@@ -18,17 +18,23 @@ import (
 const maxImportRows = 5000
 
 type ImportExportService struct {
-	mailboxes ports.MailboxRepository
-	formats   ports.MailboxFormatRepository
-	accounts  ports.PlatformAccountRepository
-	providers ports.ProviderRegistry
-	secrets   ports.SecretBroker
-	pickupKey PickupKeyPreparer
-	clock     func() time.Time
+	mailboxes         ports.MailboxRepository
+	formats           ports.MailboxFormatRepository
+	accounts          ports.PlatformAccountRepository
+	providers         ports.ProviderRegistry
+	secrets           ports.SecretBroker
+	pickupKey         PickupKeyPreparer
+	pickupKeyExporter PickupKeyExporter
+	clock             func() time.Time
 }
 
 type PickupKeyPreparer interface {
-	PrepareImported(mailboxID, label, token string) (domain.MailboxPickupKey, error)
+	PrepareImportedKey(context.Context, string, string, string) (domain.MailboxPickupKey, error)
+}
+
+type PickupKeyExporter interface {
+	Ensure(context.Context, string) (domain.MailboxPickupKey, error)
+	Reveal(context.Context, string) (string, error)
 }
 
 func NewImportExportService(mailboxes ports.MailboxRepository, formats ports.MailboxFormatRepository, accounts ports.PlatformAccountRepository, providers ports.ProviderRegistry, secrets ports.SecretBroker) (*ImportExportService, error) {
@@ -43,6 +49,10 @@ func NewImportExportService(mailboxes ports.MailboxRepository, formats ports.Mai
 
 func (s *ImportExportService) SetPickupKeyPreparer(preparer PickupKeyPreparer) {
 	s.pickupKey = preparer
+}
+
+func (s *ImportExportService) SetPickupKeyExporter(exporter PickupKeyExporter) {
+	s.pickupKeyExporter = exporter
 }
 
 type MailboxImportRequest struct {
@@ -186,6 +196,13 @@ func (s *ImportExportService) Import(ctx context.Context, request MailboxImportR
 		result, err = s.mailboxes.ImportMailboxes(ctx, items, strategy)
 		if err != nil {
 			return ImportCommitResult{}, err
+		}
+	}
+	if s.pickupKeyExporter != nil {
+		for _, mailboxID := range result.MailboxIDs {
+			if _, err := s.pickupKeyExporter.Ensure(ctx, mailboxID); err != nil {
+				return ImportCommitResult{}, fmt.Errorf("ensure pickup key for mailbox %s: %w", mailboxID, err)
+			}
 		}
 	}
 	mailboxCount, err := s.mailboxes.CountMailboxes(ctx)
@@ -437,7 +454,11 @@ func (s *ImportExportService) buildImportRow(ctx context.Context, format domain.
 		DisplayName: raw.values["display_name"], ExternalReference: raw.values["external_reference"],
 		Status: status, Metadata: metadataJSON, CreatedAt: now, UpdatedAt: now,
 	}
-	row.credentialKind = normalizeCredentialKind(raw.values["credential_kind"], provider, raw.values["password"], raw.values["refresh_token"])
+	credentialKind := raw.values["credential_kind"]
+	if strings.TrimSpace(credentialKind) == "" {
+		credentialKind = config.CredentialKind
+	}
+	row.credentialKind = normalizeCredentialKind(credentialKind, provider, raw.values["password"], raw.values["refresh_token"])
 	row.clientID, row.password, row.refreshToken = raw.values["client_id"], raw.values["password"], raw.values["refresh_token"]
 	row.pickupKey = raw.values["pickup_key"]
 	row.username = strings.TrimSpace(raw.values["username"])
@@ -511,7 +532,7 @@ func (s *ImportExportService) sealImportRow(ctx context.Context, row parsedImpor
 		if s.pickupKey == nil {
 			return domain.MailboxImportItem{}, fmt.Errorf("%w: pickup-key import preparer", domain.ErrNotConfigured)
 		}
-		pickupKey, err := s.pickupKey.PrepareImported(row.mailbox.ID, "legacy import", row.pickupKey)
+		pickupKey, err := s.pickupKey.PrepareImportedKey(ctx, row.mailbox.ID, "legacy import", row.pickupKey)
 		if err != nil {
 			return domain.MailboxImportItem{}, err
 		}
@@ -714,6 +735,16 @@ func (s *ImportExportService) exportValues(ctx context.Context, mailbox domain.M
 	values := map[string]string{
 		"address": mailbox.Address, "display_name": mailbox.DisplayName,
 		"external_reference": mailbox.ExternalReference, "provider": string(mailbox.Provider), "status": string(mailbox.Status),
+	}
+	if includeSensitive && formatHasTarget(format, "pickup_key") {
+		if s.pickupKeyExporter == nil {
+			return nil, fmt.Errorf("%w: pickup-key exporter", domain.ErrNotConfigured)
+		}
+		pickupKey, err := s.pickupKeyExporter.Reveal(ctx, mailbox.ID)
+		if err != nil {
+			return nil, err
+		}
+		values["pickup_key"] = pickupKey
 	}
 	credentials, err := s.mailboxes.ListCredentials(ctx, mailbox.ID)
 	if err != nil {
@@ -1203,6 +1234,7 @@ type parserConfig struct {
 	Platform            string `json:"platform"`
 	RecordsPath         string `json:"records_path"`
 	ProviderFromAddress bool   `json:"provider_from_address"`
+	CredentialKind      string `json:"credential_kind"`
 }
 
 func formatParserConfig(format domain.MailboxFormat) parserConfig {
@@ -1339,6 +1371,16 @@ func metadataValues(raw json.RawMessage) map[string]string {
 func formatHasSensitiveFields(format domain.MailboxFormat) bool {
 	for _, field := range format.Fields {
 		if sensitiveFormatTarget(field.Target) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatHasTarget(format domain.MailboxFormat, target string) bool {
+	target = canonicalFormatTarget(target)
+	for _, field := range format.Fields {
+		if canonicalFormatTarget(field.Target) == target {
 			return true
 		}
 	}

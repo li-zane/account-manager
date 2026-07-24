@@ -41,8 +41,9 @@ type retrievalHTTPCall struct {
 }
 
 type retrievalHTTPRetriever struct {
-	mu    sync.Mutex
-	calls []retrievalHTTPCall
+	mu         sync.Mutex
+	calls      []retrievalHTTPCall
+	receivedAt time.Time
 }
 
 func (r *retrievalHTTPRetriever) RetrievalMethods() []domain.RetrievalMethod {
@@ -54,8 +55,8 @@ func (r *retrievalHTTPRetriever) Retrieve(_ context.Context, mailbox domain.Mail
 	r.calls = append(r.calls, retrievalHTTPCall{MailboxID: mailbox.ID, Query: query})
 	r.mu.Unlock()
 	return []domain.Message{
-		{ID: "matching", RecipientAddresses: []string{query.RecipientAddress}},
-		{ID: "other", RecipientAddresses: []string{"other@example.net"}},
+		{ID: "matching", InternetMessageID: "<matching@example.test>", RecipientAddresses: []string{query.RecipientAddress}, ReceivedAt: r.receivedAt},
+		{ID: "other", InternetMessageID: "<other@example.test>", RecipientAddresses: []string{"other@example.net"}, ReceivedAt: r.receivedAt},
 	}, nil
 }
 
@@ -198,12 +199,46 @@ func TestPickupMessageRetrievalKeyStateAndAliasScope(t *testing.T) {
 	}
 }
 
+func TestCachedMessageHTTPRoutesSyncMethodAndPreserveAliasIsolation(t *testing.T) {
+	fixture := newRetrievalHTTPFixture(t)
+	path := "/api/v1/mailbox-aliases/" + fixture.alias1.ID + "/cached-messages?folder=Junk&limit=100"
+	response := retrievalRequest(fixture.router, http.MethodGet, path, retrievalHTTPAdminToken)
+	body := decodeRetrievalResponse(t, response, http.StatusOK)
+	if body["count"] != float64(0) {
+		t.Fatalf("initial cache = %+v", body)
+	}
+
+	syncPath := "/api/v1/mailbox-aliases/" + fixture.alias1.ID + "/messages/sync?folder=Junk&method=imap_password&limit=100"
+	response = retrievalRequest(fixture.router, http.MethodPost, syncPath, "")
+	decodeRetrievalResponse(t, response, http.StatusUnauthorized)
+	response = retrievalRequest(fixture.router, http.MethodPost, syncPath, retrievalHTTPAdminToken)
+	body = decodeRetrievalResponse(t, response, http.StatusOK)
+	if body["count"] != float64(1) || body["new_count"] != float64(1) {
+		t.Fatalf("synchronized alias cache = %+v", body)
+	}
+	calls := fixture.retriever.snapshot()
+	if len(calls) != 1 || calls[0].Query.Folder != domain.MessageFolderJunk || calls[0].Query.RetrievalMethod != domain.RetrievalIMAPPassword || calls[0].Query.RecipientAddress != fixture.alias1.NormalizedAddress {
+		t.Fatalf("cache sync query = %+v", calls)
+	}
+
+	response = retrievalRequest(fixture.router, http.MethodGet, path, retrievalHTTPAdminToken)
+	body = decodeRetrievalResponse(t, response, http.StatusOK)
+	if body["count"] != float64(1) {
+		t.Fatalf("cached alias messages = %+v", body)
+	}
+	response = retrievalRequest(fixture.router, http.MethodGet, "/api/v1/mailbox-aliases/"+fixture.alias2.ID+"/cached-messages?folder=Junk", retrievalHTTPAdminToken)
+	body = decodeRetrievalResponse(t, response, http.StatusOK)
+	if body["count"] != float64(0) {
+		t.Fatalf("sibling alias cache leaked messages = %+v", body)
+	}
+}
+
 func newRetrievalHTTPFixture(t *testing.T) retrievalHTTPFixture {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Date(2026, 7, 24, 16, 0, 0, 0, time.UTC)
 	store := memory.New()
-	retriever := &retrievalHTTPRetriever{}
+	retriever := &retrievalHTTPRetriever{receivedAt: now.Add(-time.Minute)}
 	provider := retrievalHTTPProvider{}
 	registry, err := providers.NewRegistry(ports.ProviderRegistration{Provider: provider, Retriever: retriever})
 	if err != nil {
@@ -223,6 +258,8 @@ func newRetrievalHTTPFixture(t *testing.T) retrievalHTTPFixture {
 	transfers, _ := service.NewImportExportService(store, store, store, registry, broker)
 	retrieval, _ := service.NewMessageRetrievalService(store, registry, providers.MessageMatchesRecipient)
 	retrieval.SetClock(func() time.Time { return now })
+	messageCache, _ := service.NewMessageCacheService(store, store, retrieval)
+	messageCache.SetClock(func() time.Time { return now })
 
 	mailbox1 := domain.Mailbox{
 		ID: "mbx_microsoft_http_one", Provider: domain.ProviderMicrosoft,
@@ -265,7 +302,8 @@ func newRetrievalHTTPFixture(t *testing.T) retrievalHTTPFixture {
 		Health: store, Providers: registry, AliasReader: store, Mailboxes: mailboxes,
 		PickupKeys: pickup, Accounts: accounts, Backups: backups, Details: details,
 		Formats: formats, Transfers: transfers, Retrieval: retrieval,
-		AdminToken: retrievalHTTPAdminToken,
+		MessageCache: messageCache,
+		AdminToken:   retrievalHTTPAdminToken,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +315,11 @@ func newRetrievalHTTPFixture(t *testing.T) retrievalHTTPFixture {
 }
 
 func retrievalGET(handler http.Handler, path, bearer string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodGet, path, nil)
+	return retrievalRequest(handler, http.MethodGet, path, bearer)
+}
+
+func retrievalRequest(handler http.Handler, method, path, bearer string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, nil)
 	if bearer != "" {
 		request.Header.Set("Authorization", "Bearer "+bearer)
 	}

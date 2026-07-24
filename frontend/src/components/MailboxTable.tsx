@@ -4,9 +4,11 @@ import {
   CircleAlert,
   CircleX,
   Copy,
+  Download,
   GitBranch,
   KeyRound,
   LoaderCircle,
+  Mail,
   PanelRightOpen,
   RefreshCw,
   ShieldCheck,
@@ -23,9 +25,9 @@ interface MailboxTableProps {
   onToggleSelected: (mailboxId: string) => void
   onToggleAll: () => void
   onCopyAddress: (address: string) => void
-  onIssueKey: (mailbox: MailboxRecord) => void
+  onOpenInbox: (mailbox: MailboxRecord) => void
+  onExportMailbox: (mailbox: MailboxRecord) => void
   onOpenDetails: (mailbox: MailboxRecord) => void
-  issuingMailboxId?: string
 }
 
 const retrievalLabels: Record<RetrievalKeyStatus, string> = {
@@ -56,16 +58,6 @@ function formatDate(value?: string): string {
   }).format(date)
 }
 
-function expiryText(value?: string): string {
-  if (!value) return '长期有效'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return '—'
-  const days = Math.ceil((date.getTime() - Date.now()) / 86_400_000)
-  if (days < 0) return `已过期 ${Math.abs(days)} 天`
-  if (days === 0) return '今天到期'
-  return `${days} 天后`
-}
-
 function RetrievalBadge({ status }: { status: RetrievalKeyStatus }) {
   const Icon = status === 'ready' ? ShieldCheck : status === 'expired' ? CircleX : CircleAlert
   return (
@@ -85,13 +77,13 @@ function MailboxCheckbox({ checked, label, onChange }: { checked: boolean; label
   )
 }
 
-function MailboxIdentity({ mailbox, isChild }: { mailbox: MailboxRecord; isChild: boolean }) {
+function MailboxIdentity({ mailbox, isChild, onCopyAddress }: { mailbox: MailboxRecord; isChild: boolean; onCopyAddress: (address: string) => void }) {
   return (
     <div className={`mailbox-identity ${isChild ? 'mailbox-identity--child' : ''}`}>
       {isChild && <GitBranch className="branch-icon" aria-hidden="true" />}
       <ProviderMark provider={mailbox.provider} size={isChild ? 'small' : 'medium'} />
       <span className="mailbox-identity__copy">
-        <strong>{mailbox.address}</strong>
+        <button className="mailbox-address-button" type="button" title="复制邮箱地址" onClick={() => onCopyAddress(mailbox.address)}>{mailbox.address}</button>
         <small>
           {mailbox.displayName || providerMeta[mailbox.provider].label}
           {!isChild && mailbox.children.length > 0 && <span className="alias-count-badge"><GitBranch />分裂 {mailbox.children.length}</span>}
@@ -118,7 +110,7 @@ function AuthDetails({ mailbox }: { mailbox: MailboxRecord }) {
   return (
     <div className="auth-cell">
       <span className="auth-modes">
-        {mailbox.auth.modes.map((mode) => <span key={mode}>{accessLabels[mode]}</span>)}
+        {mailbox.auth.modes.length > 0 ? mailbox.auth.modes.map((mode) => <span key={mode}>{accessLabels[mode]}</span>) : <span>待配置</span>}
       </span>
       {mailbox.auth.autoRefresh && (
         <span className="auto-refresh"><RefreshCw aria-hidden="true" /> 自动刷新</span>
@@ -128,23 +120,20 @@ function AuthDetails({ mailbox }: { mailbox: MailboxRecord }) {
 }
 
 function ExpiryDetails({ mailbox }: { mailbox: MailboxRecord }) {
-  const expiresAt = mailbox.auth.refreshTokenExpiresAt
-  if (!expiresAt) {
-    const forwarded = mailbox.auth.modes.length === 1 && mailbox.auth.modes[0] === 'forward'
-    return <div className="expiry-cell"><strong>{forwarded ? '不适用' : '未同步'}</strong><small>—</small></div>
+  const forwarded = mailbox.auth.modes.length === 1 && mailbox.auth.modes[0] === 'forward'
+  if (forwarded || mailbox.auth.refreshTokenValidity === 'not_applicable') return <div className="expiry-cell"><strong>不适用</strong><small>转发取件</small></div>
+  const status = mailbox.auth.refreshStatus
+  if (mailbox.auth.refreshTokenValidity === 'no_fixed_expiry') {
+    return <div className="expiry-cell"><strong>无固定到期日</strong><small>{status === 'active' ? 'RT 已配置' : status === 'due' ? 'AT 待维护' : 'RT 状态已同步'}</small></div>
   }
-  return (
-    <div className="expiry-cell">
-      <strong className={!expiresAt ? '' : expiryText(expiresAt).includes('过期') || expiryText(expiresAt).includes('今天') ? 'text-danger' : ''}>
-        {expiryText(expiresAt)}
-      </strong>
-      <small>{formatDate(expiresAt)}</small>
-    </div>
-  )
+  if (mailbox.auth.refreshTokenValidity === 'error') return <div className="expiry-cell"><strong className="text-danger">状态异常</strong><small>查看详情</small></div>
+  if (mailbox.auth.refreshTokenValidity === 'missing') return <div className="expiry-cell"><strong className="text-danger">未配置 RT</strong><small>查看详情</small></div>
+  return <div className="expiry-cell"><strong>尚未验证</strong><small>未提供固定到期日</small></div>
 }
 
 function ForwardingDetails({ mailbox }: { mailbox: MailboxRecord }) {
-  if (!mailbox.forwarding) return <span className="muted-dash">—</span>
+  if (mailbox.provider !== 'cloudflare') return <span className="muted-dash">不适用</span>
+  if (!mailbox.forwarding) return <span className="muted-dash">待配置</span>
   return (
     <div className="forward-cell">
       <span>{mailbox.forwarding.target}</span>
@@ -155,15 +144,14 @@ function ForwardingDetails({ mailbox }: { mailbox: MailboxRecord }) {
   )
 }
 
-function RowActions({ mailbox, onCopyAddress, onIssueKey, onOpenDetails, issuing }: { mailbox: MailboxRecord; onCopyAddress: (address: string) => void; onIssueKey: (mailbox: MailboxRecord) => void; onOpenDetails: (mailbox: MailboxRecord) => void; issuing: boolean }) {
+function RowActions({ mailbox, onCopyAddress, onOpenInbox, onExportMailbox, onOpenDetails }: { mailbox: MailboxRecord; onCopyAddress: (address: string) => void; onOpenInbox: (mailbox: MailboxRecord) => void; onExportMailbox: (mailbox: MailboxRecord) => void; onOpenDetails: (mailbox: MailboxRecord) => void }) {
   return (
     <div className="row-actions">
+      <button className="icon-button icon-button--small tooltip-button" data-tooltip="收件箱" type="button" title="查看收件箱" aria-label={`查看 ${mailbox.address} 的收件箱`} onClick={() => onOpenInbox(mailbox)}><Mail /></button>
       {!mailbox.parentId && <button className="icon-button icon-button--small tooltip-button" data-tooltip="邮箱详情" type="button" title="邮箱详情" aria-label={`查看 ${mailbox.address} 的详情`} onClick={() => onOpenDetails(mailbox)}>
         <PanelRightOpen />
       </button>}
-      <button className="icon-button icon-button--small tooltip-button" data-tooltip="签发取件密钥" type="button" title="签发取件密钥" aria-label={`签发 ${mailbox.address} 的取件密钥`} onClick={() => onIssueKey(mailbox)} disabled={issuing}>
-        {issuing ? <LoaderCircle className="spin" /> : <KeyRound />}
-      </button>
+      <button className="icon-button icon-button--small tooltip-button" data-tooltip="导出邮箱" type="button" title="选择格式导出" aria-label={`导出 ${mailbox.address}`} onClick={() => onExportMailbox(mailbox)}><Download /></button>
       <button className="icon-button icon-button--small tooltip-button" data-tooltip="复制邮箱" type="button" title="复制邮箱地址" aria-label={`复制 ${mailbox.address}`} onClick={() => onCopyAddress(mailbox.address)}>
         <Copy />
       </button>
@@ -179,9 +167,9 @@ export function MailboxTable({
   onToggleSelected,
   onToggleAll,
   onCopyAddress,
-  onIssueKey,
+  onOpenInbox,
+  onExportMailbox,
   onOpenDetails,
-  issuingMailboxId,
 }: MailboxTableProps) {
   const visibleRows = mailboxes.flatMap((mailbox) => [
     { mailbox, isChild: false },
@@ -210,8 +198,8 @@ export function MailboxTable({
               <th>邮箱</th>
               <th>取件密钥</th>
               <th>取件方式</th>
-              <th>RT 有效期</th>
-              <th>转发至</th>
+              <th>RT 状态</th>
+              <th>域名转发</th>
               <th>最近收件</th>
               <th className="actions-column"><span className="sr-only">操作</span></th>
             </tr>
@@ -240,7 +228,7 @@ export function MailboxTable({
                       >
                         <ChevronRight aria-hidden="true" />
                       </button>
-                      <MailboxIdentity mailbox={mailbox} isChild={isChild} />
+                      <MailboxIdentity mailbox={mailbox} isChild={isChild} onCopyAddress={onCopyAddress} />
                     </div>
                   </td>
                   <td><TokenDetails mailbox={mailbox} /></td>
@@ -248,7 +236,7 @@ export function MailboxTable({
                   <td><ExpiryDetails mailbox={mailbox} /></td>
                   <td><ForwardingDetails mailbox={mailbox} /></td>
                   <td><span className="last-mail-time">{formatDate(mailbox.lastMessageAt)}</span></td>
-                  <td className="actions-column"><RowActions mailbox={mailbox} onCopyAddress={onCopyAddress} onIssueKey={onIssueKey} onOpenDetails={onOpenDetails} issuing={issuingMailboxId === (mailbox.parentId || mailbox.id)} /></td>
+                  <td className="actions-column"><RowActions mailbox={mailbox} onCopyAddress={onCopyAddress} onOpenInbox={onOpenInbox} onExportMailbox={onExportMailbox} onOpenDetails={onOpenDetails} /></td>
                 </tr>
               )
             })}
@@ -271,7 +259,7 @@ export function MailboxTable({
                   >
                     <ChevronRight aria-hidden="true" />
                   </button>
-                  <MailboxIdentity mailbox={mailbox} isChild={isChild} />
+                  <MailboxIdentity mailbox={mailbox} isChild={isChild} onCopyAddress={onCopyAddress} />
                 </div>
                 <MailboxCheckbox checked={selectedIds.has(mailbox.id)} label={`选择 ${mailbox.address}`} onChange={() => onToggleSelected(mailbox.id)} />
               </div>
@@ -281,10 +269,10 @@ export function MailboxTable({
               </div>
               <dl className="mailbox-card__details">
                 <div><dt>取件方式</dt><dd><AuthDetails mailbox={mailbox} /></dd></div>
-                <div><dt>转发至</dt><dd><ForwardingDetails mailbox={mailbox} /></dd></div>
+                {mailbox.provider === 'cloudflare' && <div><dt>转发至</dt><dd><ForwardingDetails mailbox={mailbox} /></dd></div>}
                 <div><dt>最近收件</dt><dd>{formatDate(mailbox.lastMessageAt)}</dd></div>
               </dl>
-              <div className="mailbox-card__actions"><RowActions mailbox={mailbox} onCopyAddress={onCopyAddress} onIssueKey={onIssueKey} onOpenDetails={onOpenDetails} issuing={issuingMailboxId === (mailbox.parentId || mailbox.id)} /></div>
+              <div className="mailbox-card__actions"><RowActions mailbox={mailbox} onCopyAddress={onCopyAddress} onOpenInbox={onOpenInbox} onExportMailbox={onExportMailbox} onOpenDetails={onOpenDetails} /></div>
             </article>
           )
         })}

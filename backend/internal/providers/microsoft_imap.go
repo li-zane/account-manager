@@ -79,7 +79,7 @@ func retrieveMicrosoftIMAP(ctx context.Context, secret domain.MicrosoftCredentia
 	}()
 
 	if err := client.Authenticate(&microsoftXOAUTH2Client{username: username, accessToken: accessToken}); err != nil {
-		return nil, fmt.Errorf("Microsoft IMAP authentication failed")
+		return nil, fmt.Errorf("%w: Microsoft IMAP authentication failed", domain.ErrUnauthorized)
 	}
 	if _, err := selectMicrosoftIMAPFolder(client, secret, query.Folder); err != nil {
 		return nil, err
@@ -182,7 +182,10 @@ func (c *microsoftXOAUTH2Client) Next([]byte) ([]byte, error) {
 func microsoftRetrievalMethod(kind domain.CredentialKind, requested domain.RetrievalMethod) (domain.RetrievalMethod, error) {
 	switch kind {
 	case domain.CredentialMicrosoftGraphOAuth:
-		if requested == "" || requested == domain.RetrievalMicrosoftGraph {
+		if requested == "" || requested == domain.RetrievalMicrosoftGraph || requested == domain.RetrievalOutlookREST {
+			if requested == domain.RetrievalOutlookREST {
+				return domain.RetrievalOutlookREST, nil
+			}
 			return domain.RetrievalMicrosoftGraph, nil
 		}
 	case domain.CredentialMicrosoftIMAPOAuth:
@@ -192,6 +195,9 @@ func microsoftRetrievalMethod(kind domain.CredentialKind, requested domain.Retri
 	case domain.CredentialMicrosoftDualToken:
 		if requested == "" || requested == domain.RetrievalMicrosoftGraph {
 			return domain.RetrievalMicrosoftGraph, nil
+		}
+		if requested == domain.RetrievalOutlookREST {
+			return domain.RetrievalOutlookREST, nil
 		}
 		if requested == domain.RetrievalIMAPOAuth {
 			return domain.RetrievalIMAPOAuth, nil

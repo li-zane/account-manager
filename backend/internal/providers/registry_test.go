@@ -30,7 +30,7 @@ func TestRegistryListsProviderCapabilitiesAndRejectsDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if microsoft.Retriever == nil || len(microsoft.Retriever.RetrievalMethods()) != 3 {
+	if microsoft.Retriever == nil || len(microsoft.Retriever.RetrievalMethods()) != 4 {
 		t.Fatalf("microsoft retrieval methods = %+v", microsoft.Retriever)
 	}
 	if err := registry.Register(ports.ProviderRegistration{Provider: providers.MicrosoftAdapter{}}); !errors.Is(err, domain.ErrConflict) {

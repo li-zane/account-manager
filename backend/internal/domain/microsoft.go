@@ -10,9 +10,11 @@ const MicrosoftCredentialSecretVersion = 1
 // retrieval, which prevents a legacy platform-account token from being treated
 // as a Microsoft mailbox token.
 type MicrosoftCredentialSecret struct {
-	SchemaVersion        int             `json:"schema_version"`
-	ClientID             string          `json:"client_id"`
-	RefreshToken         string          `json:"refresh_token,omitempty"`
+	SchemaVersion int    `json:"schema_version"`
+	ClientID      string `json:"client_id"`
+	RefreshToken  string `json:"refresh_token,omitempty"`
+	// Deprecated compatibility fields are read from older encrypted payloads.
+	// New writes keep the shared Microsoft RT in RefreshToken only.
 	GraphRefreshToken    string          `json:"graph_refresh_token,omitempty"`
 	IMAPRefreshToken     string          `json:"imap_refresh_token,omitempty"`
 	AccessToken          string          `json:"access_token,omitempty"`

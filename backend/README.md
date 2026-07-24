@@ -82,11 +82,12 @@ before every pass, so settings changes apply without a restart. The environment
 variables above are operational limits and an optional process-level kill
 switch; the UI setting remains the normal control.
 
-Microsoft dual credentials support both independent Graph/IMAP grants and the
-single rotating RT chain used by legacy Outlook imports. Shared-chain refresh
-runs Graph first, applies any rotated RT, seals a durable checkpoint, and then
-refreshes IMAP with the current RT. If the IMAP call fails, the service persists
-the Graph checkpoint so a consumed rotation is not lost.
+Microsoft dual-channel credentials use one canonical rotating RT shared by
+Graph/REST and IMAP. Legacy split Graph/IMAP RT fields remain read-compatible
+and are collapsed into the canonical chain on the next successful refresh.
+Refresh runs Graph first, applies any rotated RT, seals a durable checkpoint,
+and then refreshes IMAP with the current RT. If the IMAP call fails, the service
+persists the Graph checkpoint so a consumed rotation is not lost.
 
 ## REST surface
 
@@ -186,7 +187,7 @@ go test -race ./...
 ```
 
 All three commands pass for the current tree. Coverage includes Microsoft
-Graph/IMAP and shared dual-token refresh, pickup-key scope and lifecycle,
+Graph/IMAP and shared-RT dual-channel refresh, pickup-key scope and lifecycle,
 fail-closed alias recipient filtering, legacy/template import, S3/WebDAV
 transports, target CAS, scheduler/worker concurrency, snapshot integrity, and
 asynchronous restore HTTP.

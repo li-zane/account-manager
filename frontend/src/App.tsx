@@ -23,12 +23,13 @@ import {
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 
 import { ApiClientError, apiClient } from './api/client'
-import type { MailboxDashboard, MailboxImportResult, MailboxRecord, MailProvider, TokenRefreshSettings } from './api/types'
+import type { MailboxDashboard, MailboxImportResult, MailboxRecord, MailProvider, MessageProbeSettings, TokenRefreshSettings } from './api/types'
 import { AppShell, type ViewKey, type WorkspacePlatform } from './components/AppShell'
 import { BackupPanel } from './components/BackupPanel'
 import { BackupSettings } from './components/BackupSettings'
 import { MailboxTable } from './components/MailboxTable'
 import { MailboxDetailDrawer } from './components/MailboxDetailDrawer'
+import { MailboxInboxDialog } from './components/MailboxInboxDialog'
 import { MailboxTransferDialog, type TransferMode } from './components/MailboxTransferDialog'
 import { ProviderMark, providerMeta } from './components/ProviderMark'
 import { ProviderConnectionsSettings } from './components/ProviderConnectionsSettings'
@@ -100,9 +101,9 @@ function MailboxesView({
   onToggleSelected,
   onToggleAll,
   onCopyAddress,
-  onIssueKey,
+  onOpenInbox,
+  onExportMailbox,
   onOpenDetails,
-  issuingMailboxId,
   onRefresh,
   onAdd,
   onImport,
@@ -125,9 +126,9 @@ function MailboxesView({
   onToggleSelected: (id: string) => void
   onToggleAll: () => void
   onCopyAddress: (address: string) => void
-  onIssueKey: (mailbox: MailboxRecord) => void
+  onOpenInbox: (mailbox: MailboxRecord) => void
+  onExportMailbox: (mailbox: MailboxRecord) => void
   onOpenDetails: (mailbox: MailboxRecord) => void
-  issuingMailboxId?: string
   onRefresh: () => void
   onAdd: () => void
   onImport: () => void
@@ -216,10 +217,10 @@ function MailboxesView({
             <label className="search-box"><Search aria-hidden="true" /><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索邮箱、备注或 ID" aria-label="搜索邮箱、备注或 ID" /><kbd>/</kbd></label>
           </div>
 
-          {selectedIds.size > 0 && <div className="bulk-bar"><span>已选择 <strong>{selectedIds.size}</strong> 个地址</span><button type="button"><KeyRound />批量签发密钥</button><button type="button" onClick={onExport}><Download />导出</button><button className="icon-button icon-button--tiny" type="button" title="清除选择" aria-label="清除选择" onClick={onToggleAll}><X /></button></div>}
+          {selectedIds.size > 0 && <div className="bulk-bar"><span>已选择 <strong>{selectedIds.size}</strong> 个地址</span><button type="button" onClick={onExport}><Download />导出</button><button className="icon-button icon-button--tiny" type="button" title="清除选择" aria-label="清除选择" onClick={onToggleAll}><X /></button></div>}
 
           <div className={`mailbox-list ${loading ? 'mailbox-list--loading' : ''}`}>
-            {loading && !dashboard ? <LoadingTable /> : <MailboxTable mailboxes={filteredMailboxes} expandedIds={expandedIds} selectedIds={selectedIds} onToggleExpanded={onToggleExpanded} onToggleSelected={onToggleSelected} onToggleAll={onToggleAll} onCopyAddress={onCopyAddress} onIssueKey={onIssueKey} onOpenDetails={onOpenDetails} issuingMailboxId={issuingMailboxId} />}
+            {loading && !dashboard ? <LoadingTable /> : <MailboxTable mailboxes={filteredMailboxes} expandedIds={expandedIds} selectedIds={selectedIds} onToggleExpanded={onToggleExpanded} onToggleSelected={onToggleSelected} onToggleAll={onToggleAll} onCopyAddress={onCopyAddress} onOpenInbox={onOpenInbox} onExportMailbox={onExportMailbox} onOpenDetails={onOpenDetails} />}
           </div>
           {!loading && filteredMailboxes.length > 0 && <div className="list-footer"><span>显示 {filteredMailboxes.length} 个主邮箱{query ? `，匹配“${query}”` : ''}</span><span>已展开的分裂邮箱会跟随主邮箱导出</span></div>}
         </section>
@@ -271,11 +272,15 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
     }
   })
   const [tokenRefreshSettings, setTokenRefreshSettings] = useState<TokenRefreshSettings>({ enabled: true, leadTimeMinutes: 5, version: 0 })
+  const [messageProbeSettings, setMessageProbeSettings] = useState<MessageProbeSettings>({ enabled: false, intervalMinutes: 10, version: 0 })
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [refreshLeadMinutes, setRefreshLeadMinutes] = useState(5)
+  const [autoProbe, setAutoProbe] = useState(false)
+  const [probeIntervalMinutes, setProbeIntervalMinutes] = useState(10)
   const [tokenRefreshLoading, setTokenRefreshLoading] = useState(true)
   const [tokenRefreshSaving, setTokenRefreshSaving] = useState(false)
   const [tokenRefreshDirty, setTokenRefreshDirty] = useState(false)
+  const [messageProbeDirty, setMessageProbeDirty] = useState(false)
   const [tokenRefreshError, setTokenRefreshError] = useState<string>()
   const [compactTable, setCompactTable] = useState(initialDraft.compactTable)
   const [reduceMotion, setReduceMotion] = useState(initialDraft.reduceMotion)
@@ -305,6 +310,20 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
       })
     return () => controller.abort()
   }, [])
+  useEffect(() => {
+    const controller = new AbortController()
+    void apiClient.getMessageProbeSettings(controller.signal)
+      .then((settings) => {
+        setMessageProbeSettings(settings)
+        setAutoProbe(settings.enabled)
+        setProbeIntervalMinutes(settings.intervalMinutes)
+        setMessageProbeDirty(false)
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setTokenRefreshError(error instanceof Error ? error.message : '邮件探测设置读取失败')
+      })
+    return () => controller.abort()
+  }, [])
   const update = <T,>(setter: (value: T | ((previous: T) => T)) => void, value: T | ((previous: T) => T)) => {
     setter(value)
     setDraftSaved(false)
@@ -313,19 +332,24 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
   const saveDraft = async () => {
     window.localStorage.setItem('account-manager.settings-draft.v1', JSON.stringify(settingsDraft))
     setDraftSaved(true)
-    if (!tokenRefreshDirty) return
+    if (!tokenRefreshDirty && !messageProbeDirty) return
     setTokenRefreshSaving(true)
     setTokenRefreshError(undefined)
     try {
-      const saved = await apiClient.saveTokenRefreshSettings({
-        enabled: autoRefresh,
-        leadTimeMinutes: refreshLeadMinutes,
-        version: tokenRefreshSettings.version,
-      })
-      setTokenRefreshSettings(saved)
-      setAutoRefresh(saved.enabled)
-      setRefreshLeadMinutes(saved.leadTimeMinutes)
-      setTokenRefreshDirty(false)
+      if (tokenRefreshDirty) {
+        const saved = await apiClient.saveTokenRefreshSettings({ enabled: autoRefresh, leadTimeMinutes: refreshLeadMinutes, version: tokenRefreshSettings.version })
+        setTokenRefreshSettings(saved)
+        setAutoRefresh(saved.enabled)
+        setRefreshLeadMinutes(saved.leadTimeMinutes)
+        setTokenRefreshDirty(false)
+      }
+      if (messageProbeDirty) {
+        const saved = await apiClient.saveMessageProbeSettings({ enabled: autoProbe, intervalMinutes: probeIntervalMinutes, version: messageProbeSettings.version })
+        setMessageProbeSettings(saved)
+        setAutoProbe(saved.enabled)
+        setProbeIntervalMinutes(saved.intervalMinutes)
+        setMessageProbeDirty(false)
+      }
       onServerChange()
     } catch (error) {
       if (error instanceof ApiClientError && error.status === 409) {
@@ -338,7 +362,7 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
     }
   }
   const exportDraft = () => {
-    const exportedSettings = { ...settingsDraft, tokenRefresh: { enabled: autoRefresh, leadTimeMinutes: refreshLeadMinutes } }
+    const exportedSettings = { ...settingsDraft, tokenRefresh: { enabled: autoRefresh, leadTimeMinutes: refreshLeadMinutes }, messageProbe: { enabled: autoProbe, intervalMinutes: probeIntervalMinutes } }
     const url = URL.createObjectURL(new Blob([JSON.stringify(exportedSettings, null, 2)], { type: 'application/json' }))
     const link = document.createElement('a')
     link.href = url
@@ -351,7 +375,12 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
     setTokenRefreshDirty(true)
     setTokenRefreshError(undefined)
   }
-  const settingsSaved = draftSaved && !tokenRefreshDirty
+  const updateMessageProbe = (updateValue: () => void) => {
+    updateValue()
+    setMessageProbeDirty(true)
+    setTokenRefreshError(undefined)
+  }
+  const settingsSaved = draftSaved && !tokenRefreshDirty && !messageProbeDirty
   const statusLabel = tokenRefreshLoading
     ? '正在读取服务器设置'
     : tokenRefreshSaving
@@ -365,13 +394,13 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
       <div className="page-heading"><div><div className="heading-kicker"><span className="source-dot source-dot--api" />系统设置</div><h1>设置</h1><p className="heading-meta">偏好与连接配置</p></div>{(activeSection === 'mail' || activeSection === 'interface') && <div className="page-actions"><button className="secondary-button" type="button" onClick={exportDraft}><ArchiveRestore />导出设置</button><button className="primary-button" type="button" onClick={() => void saveDraft()} disabled={tokenRefreshSaving}><Check />保存设置</button></div>}</div>
       <div className="settings-layout">
         <nav className="settings-nav" aria-label="设置分类">
-          <button className={activeSection === 'mail' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('mail')}><KeyRound />邮箱取件<span>3</span></button>
+          <button className={activeSection === 'mail' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('mail')}><KeyRound />邮箱取件<span>5</span></button>
           <button className={activeSection === 'connections' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('connections')}><CloudCog />服务连接</button>
           <button className={activeSection === 'backup' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('backup')}><Database />数据备份</button>
           <button className={activeSection === 'interface' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('interface')}><SlidersHorizontal />界面与导航</button>
         </nav>
         <section className="settings-section">
-          {activeSection === 'mail' && <><div className="section-heading"><div><p className="eyebrow">MAIL ACCESS</p><h2>邮箱取件</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>自动维护 OAuth 令牌</strong><small>访问令牌到期前 {refreshLeadMinutes} 分钟刷新</small></div><Toggle checked={autoRefresh} onChange={() => updateTokenRefresh(() => setAutoRefresh((value) => !value))} label="自动维护 OAuth 令牌" disabled={tokenRefreshLoading || tokenRefreshSaving} /></div><div className="setting-row"><div><strong>默认取件格式</strong><small>新建邮箱使用的平台格式</small></div><label className="select-control"><select value={retrievalMode} aria-label="默认取件格式" onChange={(event) => update(setRetrievalMode, event.target.value)}><option value="dual">双令牌</option><option value="graph">Graph</option><option value="imap">IMAP</option></select><ChevronDown /></label></div><div className="setting-row"><div><strong>刷新提前时间</strong><small>Graph 与 OAuth 访问令牌</small></div><label className="number-control"><input type="number" value={refreshLeadMinutes} min={1} max={30} disabled={tokenRefreshLoading || tokenRefreshSaving} onChange={(event) => updateTokenRefresh(() => setRefreshLeadMinutes(Math.min(30, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div></div>{tokenRefreshError && <div className="settings-sync-error" role="alert">{tokenRefreshError}</div>}</>}
+          {activeSection === 'mail' && <><div className="section-heading"><div><p className="eyebrow">MAIL ACCESS</p><h2>邮箱取件</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>自动维护 OAuth 令牌</strong><small>当前关闭时，手动与自动取件均不会刷新 RT</small></div><Toggle checked={autoRefresh} onChange={() => updateTokenRefresh(() => setAutoRefresh((value) => !value))} label="自动维护 OAuth 令牌" disabled={tokenRefreshLoading || tokenRefreshSaving} /></div><div className="setting-row"><div><strong>自动探测新邮件</strong><small>按间隔增量拉取收件箱与垃圾箱</small></div><Toggle checked={autoProbe} onChange={() => updateMessageProbe(() => setAutoProbe((value) => !value))} label="自动探测新邮件" disabled={tokenRefreshSaving} /></div><div className="setting-row"><div><strong>探测间隔</strong><small>后台缓存增量同步周期</small></div><label className="number-control"><input type="number" value={probeIntervalMinutes} min={1} max={1440} disabled={tokenRefreshSaving} onChange={(event) => updateMessageProbe(() => setProbeIntervalMinutes(Math.min(1440, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div><div className="setting-row"><div><strong>默认取件能力</strong><small>Microsoft 共享 RT 的首选通道</small></div><label className="select-control"><select value={retrievalMode} aria-label="默认取件能力" onChange={(event) => update(setRetrievalMode, event.target.value)}><option value="dual">Graph + REST + IMAP</option><option value="graph">Graph</option><option value="imap">IMAP</option></select><ChevronDown /></label></div><div className="setting-row"><div><strong>刷新提前时间</strong><small>仅用于短期访问令牌，不代表 RT 到期日</small></div><label className="number-control"><input type="number" value={refreshLeadMinutes} min={1} max={30} disabled={tokenRefreshLoading || tokenRefreshSaving} onChange={(event) => updateTokenRefresh(() => setRefreshLeadMinutes(Math.min(30, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div></div>{tokenRefreshError && <div className="settings-sync-error" role="alert">{tokenRefreshError}</div>}</>}
           {activeSection === 'connections' && <ProviderConnectionsSettings />}
           {activeSection === 'backup' && <BackupSettings onServerChange={onServerChange} />}
           {activeSection === 'interface' && <><div className="section-heading"><div><p className="eyebrow">NAVIGATION</p><h2>界面与导航</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>固定工作区</strong><small>显示在左侧导航中</small></div><button className="select-control" type="button">ChatGPT、Grok <ChevronDown /></button></div><div className="setting-row"><div><strong>紧凑表格</strong><small>在宽屏中显示更多邮箱字段</small></div><Toggle checked={compactTable} onChange={() => update(setCompactTable, (value) => !value)} label="紧凑表格" /></div><div className="setting-row"><div><strong>减少动效</strong><small>适用于需要降低动态效果的环境</small></div><Toggle checked={reduceMotion} onChange={() => update(setReduceMotion, (value) => !value)} label="减少动效" /></div></div></>}
@@ -401,25 +430,9 @@ function AddMailboxDialog({ open, submitting, managedMailboxes, onClose, onSubmi
         </div>
         <label className="field-label">邮箱地址<input autoFocus value={address} onChange={(event) => setAddress(event.target.value)} placeholder={provider === 'cloudflare' ? 'verify@example.com' : 'name@example.com'} type="email" required /></label>
         {provider === 'cloudflare' && <div className="field-label">转发到<label className="select-control select-control--wide"><select value={forwardingMailboxId} onChange={(event) => setForwardingMailboxId(event.target.value)} required disabled={managedMailboxes.length === 0} aria-label="Cloudflare 转发邮箱">{managedMailboxes.length === 0 && <option value="">暂无可用目标邮箱</option>}{managedMailboxes.map((mailbox) => <option value={mailbox.id} key={mailbox.id}>{mailbox.address}</option>)}</select><ChevronDown /></label></div>}
-        <div className="modal-hint"><KeyRound />保存后可签发平台取件密钥，上游令牌不会出现在导出数据中。</div>
+        <div className="modal-hint"><KeyRound />保存后自动签发本站取件密钥；上游令牌仅在明确选择敏感格式时导出。</div>
         <div className="modal__actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>取消</button><button className="primary-button" type="submit" disabled={submitting || (provider === 'cloudflare' && !forwardingMailboxId)}>{submitting ? <LoaderCircle className="spin" /> : <Plus />}{submitting ? '正在添加' : '添加邮箱'}</button></div>
       </form>
-    </div>
-  )
-}
-
-function PickupKeyDialog({ address, token, onClose }: { address: string; token: string; onClose: () => void }) {
-  const copy = async () => {
-    try { await navigator.clipboard?.writeText(token) } catch { /* clipboard permission is optional */ }
-  }
-  return (
-    <div className="modal-layer" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal modal--pickup-key" role="dialog" aria-modal="true" aria-label="取件密钥已签发">
-        <div className="modal__header"><div><p className="eyebrow">PICKUP KEY</p><h2>取件密钥已签发</h2></div><button className="icon-button" type="button" title="关闭" aria-label="关闭取件密钥" onClick={onClose}><X /></button></div>
-        <p className="issued-key-address">{address}</p>
-        <label className="field-label">仅显示一次<div className="issued-key-value"><input value={token} readOnly aria-label="新取件密钥" /><button className="secondary-button" type="button" onClick={copy}><KeyRound />复制</button></div></label>
-        <div className="modal__actions"><button className="primary-button" type="button" onClick={onClose}><Check />完成</button></div>
-      </section>
     </div>
   )
 }
@@ -436,9 +449,8 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [backupRunning, setBackupRunning] = useState(false)
   const [addingMailbox, setAddingMailbox] = useState(false)
-  const [issuingMailboxId, setIssuingMailboxId] = useState<string>()
-  const [issuedKey, setIssuedKey] = useState<{ address: string; token: string }>()
   const [detailMailbox, setDetailMailbox] = useState<MailboxRecord>()
+  const [inboxMailbox, setInboxMailbox] = useState<MailboxRecord>()
   const [transferMode, setTransferMode] = useState<TransferMode>()
   const [view, setView] = useState<ViewKey>(() => {
     const hash = window.location.hash.replace('#', '')
@@ -488,7 +500,7 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
 
-  const overlayOpen = addOpen || Boolean(issuedKey) || Boolean(detailMailbox) || Boolean(transferMode)
+  const overlayOpen = addOpen || Boolean(detailMailbox) || Boolean(inboxMailbox) || Boolean(transferMode)
   useEffect(() => {
     if (!overlayOpen) return
     const previousOverflow = document.body.style.overflow
@@ -607,7 +619,7 @@ export default function App() {
       address,
       displayName: '新建邮箱',
       health: 'attention',
-      retrievalKey: { status: 'missing' },
+      retrievalKey: { status: 'ready', maskedKey: 'am_pk_preview...' },
       auth: { modes: provider === 'google' ? ['oauth'] : ['graph'], autoRefresh: false },
       children: [],
     }
@@ -617,20 +629,9 @@ export default function App() {
     setAddingMailbox(false)
   }
 
-  const handleIssueKey = async (mailbox: MailboxRecord) => {
-    const mailboxId = mailbox.parentId || mailbox.id
-    setIssuingMailboxId(mailboxId)
-    try {
-      const token = source === 'api'
-        ? await apiClient.issuePickupKey(mailboxId, `console:${mailbox.address}`)
-        : `am_pk_preview_${Date.now().toString(36)}`
-      setIssuedKey({ address: mailbox.address, token })
-      if (source === 'api') await loadDashboard()
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : '取件密钥签发失败')
-    } finally {
-      setIssuingMailboxId(undefined)
-    }
+  const handleExportMailbox = (mailbox: MailboxRecord) => {
+    setSelectedIds(new Set([mailbox.parentId || mailbox.id]))
+    setTransferMode('export')
   }
 
   const handleImported = (result: MailboxImportResult) => {
@@ -645,12 +646,12 @@ export default function App() {
 
   return (
     <AppShell currentView={view} onViewChange={setView} onOpenWorkspace={openWorkspace} source={source}>
-      {view === 'mailboxes' && <MailboxesView dashboard={dashboard} source={source} warning={warning} loading={loading} refreshing={refreshing} filter={filter} query={query} expandedIds={expandedIds} selectedIds={selectedIds} onFilterChange={setFilter} onQueryChange={setQuery} onToggleExpanded={handleToggleExpanded} onToggleSelected={handleToggleSelected} onToggleAll={handleToggleAll} onCopyAddress={handleCopyAddress} onIssueKey={handleIssueKey} onOpenDetails={setDetailMailbox} issuingMailboxId={issuingMailboxId} onRefresh={handleRefresh} onAdd={() => setAddOpen(true)} onImport={() => setTransferMode('import')} onExport={() => setTransferMode('export')} onRunBackup={handleRunBackup} backupRunning={backupRunning} />}
+      {view === 'mailboxes' && <MailboxesView dashboard={dashboard} source={source} warning={warning} loading={loading} refreshing={refreshing} filter={filter} query={query} expandedIds={expandedIds} selectedIds={selectedIds} onFilterChange={setFilter} onQueryChange={setQuery} onToggleExpanded={handleToggleExpanded} onToggleSelected={handleToggleSelected} onToggleAll={handleToggleAll} onCopyAddress={handleCopyAddress} onOpenInbox={setInboxMailbox} onExportMailbox={handleExportMailbox} onOpenDetails={setDetailMailbox} onRefresh={handleRefresh} onAdd={() => setAddOpen(true)} onImport={() => setTransferMode('import')} onExport={() => setTransferMode('export')} onRunBackup={handleRunBackup} backupRunning={backupRunning} />}
       {view === 'workspace' && <WorkspaceView platform={workspacePlatform} onPlatformChange={setWorkspacePlatform} />}
       {view === 'settings' && <SettingsView onServerChange={refreshDashboardFromSettings} />}
       <AddMailboxDialog open={addOpen} submitting={addingMailbox} managedMailboxes={(dashboard?.mailboxes ?? []).filter((mailbox) => mailbox.provider !== 'cloudflare')} onClose={() => setAddOpen(false)} onSubmit={handleAddMailbox} />
-      {issuedKey && <PickupKeyDialog address={issuedKey.address} token={issuedKey.token} onClose={() => setIssuedKey(undefined)} />}
       {detailMailbox && <MailboxDetailDrawer mailbox={detailMailbox} onClose={() => setDetailMailbox(undefined)} />}
+      {inboxMailbox && <MailboxInboxDialog mailbox={inboxMailbox} onClose={() => setInboxMailbox(undefined)} />}
       <MailboxTransferDialog open={Boolean(transferMode)} initialMode={transferMode ?? 'import'} mailboxes={dashboard?.mailboxes ?? []} selectedIds={selectedIds} source={source} onClose={() => setTransferMode(undefined)} onImported={handleImported} />
       {toast && <div className="toast" role="status"><Check aria-hidden="true" /><span>{toast}</span><button className="icon-button icon-button--tiny" type="button" title="关闭提示" aria-label="关闭提示" onClick={() => setToast(undefined)}><X /></button></div>}
     </AppShell>

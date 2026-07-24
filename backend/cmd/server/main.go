@@ -76,8 +76,9 @@ func run(logger *slog.Logger) error {
 	}
 	providerHTTPClient := &http.Client{Timeout: 30 * time.Second}
 	microsoft := providers.NewMicrosoftAdapter(providers.MicrosoftConfig{
-		TokenEndpoint: strings.TrimSpace(os.Getenv("MICROSOFT_TOKEN_ENDPOINT")),
-		GraphBaseURL:  strings.TrimSpace(os.Getenv("MICROSOFT_GRAPH_BASE_URL")),
+		TokenEndpoint:      strings.TrimSpace(os.Getenv("MICROSOFT_TOKEN_ENDPOINT")),
+		GraphBaseURL:       strings.TrimSpace(os.Getenv("MICROSOFT_GRAPH_BASE_URL")),
+		OutlookRESTBaseURL: strings.TrimSpace(os.Getenv("MICROSOFT_OUTLOOK_REST_BASE_URL")),
 	}, broker, providerHTTPClient)
 	gmail := providers.NewGmailAdapter(broker, providerHTTPClient)
 	gmail.APIBase = strings.TrimSpace(os.Getenv("GMAIL_API_BASE_URL"))
@@ -112,9 +113,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create pickup key service: %w", err)
 	}
+	pickupKeys.SetSecretBroker(broker)
 	mailboxes, err := service.NewMailboxService(store, registry)
 	if err != nil {
 		return err
+	}
+	mailboxes.SetPickupKeyEnsurer(pickupKeys)
+	if err := ensureMailboxPickupKeys(rootCtx, store, pickupKeys); err != nil {
+		return fmt.Errorf("ensure automatic pickup keys: %w", err)
 	}
 	retrieval, err := service.NewMessageRetrievalService(store, registry, providers.MessageMatchesRecipient)
 	if err != nil {
@@ -124,11 +130,25 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create token refresh settings service: %w", err)
 	}
+	retrieval.SetSettingsReader(tokenRefreshSettings)
 	stopCredentialRefreshRuntime, err := startCredentialRefreshRuntime(rootCtx, store, retrieval, tokenRefreshSettings, logger)
 	if err != nil {
 		return err
 	}
 	defer stopCredentialRefreshRuntime()
+	messageCache, err := service.NewMessageCacheService(store, store, retrieval)
+	if err != nil {
+		return err
+	}
+	messageProbeSettings, err := service.NewMessageProbeSettingsService(store)
+	if err != nil {
+		return err
+	}
+	stopMessageProbeRuntime, err := startMessageProbeRuntime(rootCtx, store, messageCache, messageProbeSettings, logger)
+	if err != nil {
+		return err
+	}
+	defer stopMessageProbeRuntime()
 	accounts, err := service.NewAccountService(store, store)
 	if err != nil {
 		return err
@@ -150,6 +170,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	transfers.SetPickupKeyPreparer(pickupKeys)
+	transfers.SetPickupKeyExporter(pickupKeys)
 	backups, err := service.NewBackupService(store, broker)
 	if err != nil {
 		return err
@@ -166,6 +187,7 @@ func run(logger *slog.Logger) error {
 		PickupKeys: pickupKeys, Accounts: accounts, Backups: backups,
 		BackupRestores: backupRestores,
 		Details:        details, Formats: formats, Transfers: transfers, Retrieval: retrieval,
+		MessageCache: messageCache, MessageProbeSettings: messageProbeSettings,
 		ProviderConnections: providerConnections, TokenRefreshSettings: tokenRefreshSettings,
 		AdminToken: adminToken, Logger: logger,
 	})
@@ -248,6 +270,68 @@ func startCredentialRefreshRuntime(parent context.Context, repository service.Cr
 			case <-done:
 			case <-time.After(10 * time.Second):
 				logger.Warn("credential refresh worker shutdown timed out")
+			}
+		})
+	}, nil
+}
+
+func ensureMailboxPickupKeys(ctx context.Context, repository ports.MailboxRepository, keys service.PickupKeyEnsurer) error {
+	for offset := 0; ; offset += 500 {
+		mailboxes, err := repository.ListMailboxes(ctx, ports.ListOptions{Limit: 500, Offset: offset})
+		if err != nil {
+			return err
+		}
+		for _, mailbox := range mailboxes {
+			if _, err := keys.Ensure(ctx, mailbox.ID); err != nil {
+				return fmt.Errorf("mailbox %s: %w", mailbox.ID, err)
+			}
+		}
+		if len(mailboxes) < 500 {
+			return nil
+		}
+	}
+}
+
+func startMessageProbeRuntime(parent context.Context, store ports.Store, cache *service.MessageCacheService, settings *service.MessageProbeSettingsService, logger *slog.Logger) (func(), error) {
+	if strings.EqualFold(envOrDefault("MESSAGE_PROBE_WORKER_ENABLED", "true"), "false") {
+		logger.Info("message probe worker disabled by environment")
+		return func() {}, nil
+	}
+	heartbeat, err := envDuration("MESSAGE_PROBE_WORKER_HEARTBEAT", time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	concurrency, err := envPositiveInt("MESSAGE_PROBE_WORKER_CONCURRENCY", 4)
+	if err != nil {
+		return nil, err
+	}
+	itemTimeout, err := envDuration("MESSAGE_PROBE_WORKER_ITEM_TIMEOUT", 45*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	worker, err := service.NewMessageProbeWorker(store, store, cache, settings, logger, service.MessageProbeWorkerConfig{
+		Enabled: true, Heartbeat: heartbeat, Concurrency: concurrency, ItemTimeout: itemTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	runtimeCtx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := worker.Run(runtimeCtx); err != nil {
+			logger.Error("message probe worker stopped", "error", err)
+		}
+	}()
+	logger.Info("message probe worker started", "heartbeat", heartbeat, "concurrency", concurrency, "item_timeout", itemTimeout)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				logger.Warn("message probe worker shutdown timed out")
 			}
 		})
 	}, nil

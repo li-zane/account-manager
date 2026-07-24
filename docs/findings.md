@@ -36,15 +36,15 @@ The supplied Kawaii Minimal page calls for warm white backgrounds (`#FFF7ED`), p
 - Mailbox totals count only primary mailbox identities. Split and forwarding aliases are displayed as child counts on their parent.
 - Mailbox details expose provider metadata, credential kind, expiry and refresh state. Client IDs are displayable; refresh tokens remain masked until an explicit authenticated reveal action.
 - Import formats define kind, direction, provider, delimiter/header behavior, ordered field mappings, and parser configuration. Import runs support preview/validation and an explicit conflict policy before transactional apply.
-- Export excludes upstream provider secrets by default. Platform pickup keys remain one-time values and therefore cannot be reconstructed for export after issuance.
+- Export excludes upstream provider secrets by default. Newly issued platform pickup keys keep an encrypted administrator-export copy alongside the authentication digest; legacy digest-only keys remain non-reconstructable.
 - Split-address retrieval must use exact normalized-recipient matching across provider-native recipients and headers such as `Delivered-To`, `X-Original-To`, `Envelope-To`, `X-Envelope-To`, and `To`/`Cc` as a lower-confidence fallback.
 - Custom template formats now support reversible single-line and multiline records, JSON-encoded variables, and one `%begin ... %end%` repeat block with an optional quoted separator.
 - Desktop content uses the available viewport width. Operational detail/preview/backup text has a 14px floor, controls are at least 44px where practical, and the 390px layout remains free of page-level horizontal overflow.
 
 ## Token and Retrieval Semantics
 
-- A current Microsoft dual-token credential may store distinct Graph and IMAP refresh/access tokens and per-method expiries.
-- A legacy Outlook record carries one rotating refresh-token chain. Compatibility refresh therefore calls Graph first, updates all shared RT fields with any rotated token, seals a checkpoint, and then calls IMAP with that current token. If the second call fails or times out, the Graph checkpoint is persisted instead of losing the rotation.
+- A current Microsoft dual-channel credential stores one canonical RT plus distinct short-lived Graph and IMAP access tokens and per-method AT expiries.
+- Legacy Outlook records with split RT fields are read-compatible, but public details and new writes expose one shared rotating chain. Refresh calls Graph first, checkpoints any rotated RT, and then calls IMAP with the current chain token. If the second call fails or times out, the Graph checkpoint is persisted instead of losing the rotation.
 - Refresh-token strings do not contain trustworthy expiry metadata. Status is derived from access-token expiry, `refresh_after`, and recorded refresh results; the UI does not invent an RT expiration date.
 - On-demand retrieval coalesces concurrent refresh attempts for the same credential. The background worker separately bounds scan pagination, job concurrency, item timeout, and error retry backoff.
 - Administrator retrieval and pickup-key retrieval share the same routing service. The platform key replaces upstream credentials at the HTTP boundary and never grants access to an alias owned by another mailbox.

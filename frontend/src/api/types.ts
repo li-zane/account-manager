@@ -16,6 +16,10 @@ export interface RetrievalKeySummary {
 export interface MailAuthSummary {
   modes: MailAccessMode[]
   refreshTokenExpiresAt?: string
+  refreshStatus?: string
+  refreshTokenValidity?: 'no_fixed_expiry' | 'missing' | 'error' | 'unknown' | 'not_applicable'
+  graphAccessTokenExpiresAt?: string
+  imapAccessTokenExpiresAt?: string
   autoRefresh: boolean
 }
 
@@ -45,12 +49,10 @@ export interface MailboxCredentialSummary {
   credentialType: string
   clientId?: string
   retrievalMethods: string[]
+  retrievalCapabilities: RetrievalCapabilitySummary[]
   maskedRefreshToken?: string
   hasRefreshToken: boolean
-  maskedGraphRefreshToken?: string
-  hasGraphRefreshToken: boolean
-  maskedImapRefreshToken?: string
-  hasImapRefreshToken: boolean
+  refreshTokenValidity?: MailAuthSummary['refreshTokenValidity']
   expiresAt?: string
   graphTokenExpiresAt?: string
   imapTokenExpiresAt?: string
@@ -59,6 +61,15 @@ export interface MailboxCredentialSummary {
   lastRefreshedAt?: string
   lastRefreshError?: string
   autoRefresh: boolean
+}
+
+export type RetrievalCapabilityStatus = 'configured' | 'verified' | 'failed' | 'unknown'
+
+export interface RetrievalCapabilitySummary {
+  method: string
+  status: RetrievalCapabilityStatus
+  accessTokenExpiresAt?: string
+  checkedAt?: string
 }
 
 export interface MailboxAliasDetail {
@@ -87,14 +98,45 @@ export interface MailboxDetail {
 export interface RevealedCredential {
   clientId?: string
   refreshToken: string
-  graphRefreshToken?: string
-  imapRefreshToken?: string
   credentialType: string
   retrievalMethods: string[]
+  retrievalCapabilities: RetrievalCapabilitySummary[]
+  refreshTokenValidity?: MailAuthSummary['refreshTokenValidity']
   expiresAt?: string
   graphTokenExpiresAt?: string
   imapTokenExpiresAt?: string
   revealedUntil?: string
+}
+
+export type MessageFolder = 'INBOX' | 'Junk'
+
+export interface CachedMessage {
+  id: string
+  providerMessageId: string
+  internetMessageId?: string
+  folder: MessageFolder
+  from: string
+  to: string[]
+  cc: string[]
+  subject: string
+  text?: string
+  html?: string
+  receivedAt: string
+  unread: boolean
+}
+
+export interface MessageSyncState {
+  targetId: string
+  lastMessageAt?: string
+  lastSyncedAt: string
+  lastError?: string
+}
+
+export interface CachedMessagesResult {
+  messages: CachedMessage[]
+  count: number
+  newCount: number
+  sync?: MessageSyncState
 }
 
 export interface ProviderConnection {
@@ -135,6 +177,19 @@ export interface SaveTokenRefreshSettingsInput {
   version: number
 }
 
+export interface MessageProbeSettings {
+  enabled: boolean
+  intervalMinutes: number
+  version: number
+  updatedAt?: string
+}
+
+export interface SaveMessageProbeSettingsInput {
+  enabled: boolean
+  intervalMinutes: number
+  version: number
+}
+
 export type MailboxFormatKind = 'delimited' | 'json' | 'template'
 export type MailboxFormatDirection = 'import' | 'export' | 'both'
 
@@ -154,7 +209,7 @@ export interface MailboxFormat {
   delimiter: string
   hasHeader: boolean
   fields: MailboxFormatField[]
-  provider?: string
+  provider?: 'microsoft' | 'gmail' | 'cloudflare_route'
   template?: string
   builtIn: boolean
   enabled: boolean

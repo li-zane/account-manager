@@ -14,7 +14,12 @@ import (
 type MailboxService struct {
 	repository ports.MailboxRepository
 	providers  ports.ProviderRegistry
+	pickupKeys PickupKeyEnsurer
 	clock      func() time.Time
+}
+
+type PickupKeyEnsurer interface {
+	Ensure(context.Context, string) (domain.MailboxPickupKey, error)
 }
 
 func NewMailboxService(repository ports.MailboxRepository, providers ports.ProviderRegistry) (*MailboxService, error) {
@@ -28,6 +33,10 @@ func (s *MailboxService) SetClock(clock func() time.Time) {
 	if clock != nil {
 		s.clock = clock
 	}
+}
+
+func (s *MailboxService) SetPickupKeyEnsurer(ensurer PickupKeyEnsurer) {
+	s.pickupKeys = ensurer
 }
 
 type CreateMailboxInput struct {
@@ -66,6 +75,11 @@ func (s *MailboxService) Create(ctx context.Context, input CreateMailboxInput) (
 	}
 	if err := s.repository.CreateMailbox(ctx, mailbox); err != nil {
 		return domain.Mailbox{}, err
+	}
+	if s.pickupKeys != nil {
+		if _, err := s.pickupKeys.Ensure(ctx, mailbox.ID); err != nil {
+			return domain.Mailbox{}, fmt.Errorf("ensure mailbox pickup key: %w", err)
+		}
 	}
 	return mailbox, nil
 }

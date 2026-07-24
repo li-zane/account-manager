@@ -63,7 +63,7 @@ func TestMicrosoftRefreshRotatesTokenAndTracksExpiry(t *testing.T) {
 		t.Fatalf("key version = %q", refreshed.KeyVersion)
 	}
 	secret := openMicrosoftCredential(t, broker, refreshed.EncryptedSecret, refreshed.KeyVersion)
-	if secret.GraphAccessToken != "new-graph-access-token" || secret.GraphRefreshToken != newRefreshToken || secret.RefreshToken != newRefreshToken {
+	if secret.GraphAccessToken != "new-graph-access-token" || secret.RefreshToken != newRefreshToken || secret.GraphRefreshToken != "" || secret.IMAPRefreshToken != "" {
 		t.Fatalf("rotated credential was not persisted: %+v", redactMicrosoftSecret(secret))
 	}
 	if secret.GraphTokenExpiresAt == nil || !secret.GraphTokenExpiresAt.Equal(wantExpiry) {
@@ -112,7 +112,7 @@ func TestMicrosoftDualCredentialRefreshesGraphAndIMAPInSharedChain(t *testing.T)
 		t.Fatalf("refresh requests = %v", requests)
 	}
 	secret := openMicrosoftCredential(t, broker, refreshed.EncryptedSecret, refreshed.KeyVersion)
-	if secret.RefreshToken != "imap-rt-3" || secret.GraphRefreshToken != "imap-rt-3" || secret.IMAPRefreshToken != "imap-rt-3" {
+	if secret.RefreshToken != "imap-rt-3" || secret.GraphRefreshToken != "" || secret.IMAPRefreshToken != "" {
 		t.Fatalf("dual refresh tokens = %+v", redactMicrosoftSecret(secret))
 	}
 	if secret.GraphAccessToken != "graph-at" || secret.IMAPAccessToken != "imap-at" {
@@ -121,6 +121,33 @@ func TestMicrosoftDualCredentialRefreshesGraphAndIMAPInSharedChain(t *testing.T)
 	wantExpiry := now.Add(30 * time.Minute)
 	if refreshed.ExpiresAt == nil || !refreshed.ExpiresAt.Equal(wantExpiry) {
 		t.Fatalf("dual expiry = %v, want earliest %v", refreshed.ExpiresAt, wantExpiry)
+	}
+}
+
+func TestMicrosoftDualCredentialUsesDefaultIMAPScope(t *testing.T) {
+	var requestedScopes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		requestedScopes = append(requestedScopes, r.Form.Get("scope"))
+		writeJSON(t, w, map[string]any{
+			"access_token": "access-token", "refresh_token": "rotated-token", "expires_in": 3600,
+		})
+	}))
+	t.Cleanup(server.Close)
+	broker := testSecretBroker{}
+	credential := sealMicrosoftCredential(t, broker, domain.CredentialMicrosoftDualToken, domain.MicrosoftCredentialSecret{
+		SchemaVersion: domain.MicrosoftCredentialSecretVersion,
+		ClientID:      "client-id",
+		RefreshToken:  "refresh-token",
+	})
+	adapter := NewMicrosoftAdapter(MicrosoftConfig{TokenEndpoint: server.URL}, broker, server.Client())
+	if _, err := adapter.Refresh(context.Background(), microsoftMailbox(), credential); err != nil {
+		t.Fatal(err)
+	}
+	if len(requestedScopes) != 2 || requestedScopes[0] != "" || requestedScopes[1] != defaultMicrosoftIMAPScope {
+		t.Fatalf("requested scopes = %v", requestedScopes)
 	}
 }
 
@@ -176,7 +203,7 @@ func TestMicrosoftDualCredentialReturnsGraphCheckpointWhenIMAPRefreshFails(t *te
 		t.Fatalf("partial checkpoint = %+v", checkpoint)
 	}
 	secret := openMicrosoftCredential(t, broker, checkpoint.EncryptedSecret, checkpoint.KeyVersion)
-	if secret.RefreshToken != graphRefreshToken || secret.GraphRefreshToken != graphRefreshToken || secret.IMAPRefreshToken != graphRefreshToken {
+	if secret.RefreshToken != graphRefreshToken || secret.GraphRefreshToken != "" || secret.IMAPRefreshToken != "" {
 		t.Fatalf("checkpoint refresh tokens = %+v", redactMicrosoftSecret(secret))
 	}
 	if secret.GraphAccessToken != "new-graph-at" || secret.IMAPAccessToken != "old-imap-at" {
@@ -309,6 +336,89 @@ func TestMicrosoftGraphJunkFolderAndQueryFilters(t *testing.T) {
 	}
 }
 
+func TestMicrosoftUsesOutlookRESTForLegacyScopeAndFiltersRecipients(t *testing.T) {
+	const accessToken = "legacy-outlook-access-token"
+	var graphCalls, restCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+accessToken {
+			t.Fatalf("authorization header = %q", r.Header.Get("Authorization"))
+		}
+		if strings.HasPrefix(r.URL.Path, "/graph/") {
+			graphCalls++
+			t.Fatal("legacy Outlook scope reached Microsoft Graph")
+		}
+		restCalls++
+		if !strings.Contains(r.URL.Path, "/rest/me/mailfolders/inbox/messages") {
+			t.Fatalf("REST path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("page") == "2" {
+			writeJSON(t, w, map[string]any{"value": []any{
+				graphFixture("alias-match", "destination@outlook.com", []map[string]string{{"name": "X-Original-To", "value": "Alias.A@rainynight.me"}}),
+			}})
+			return
+		}
+		if r.URL.Query().Get("$top") != "1" || !strings.Contains(r.URL.Query().Get("$select"), "InternetMessageHeaders") {
+			t.Fatalf("REST query = %v", r.URL.Query())
+		}
+		writeJSON(t, w, map[string]any{
+			"value":           []any{graphFixture("other-recipient", "other@rainynight.me", nil)},
+			"@odata.nextLink": serverURLFromRequest(r) + "/rest/me/mailfolders/inbox/messages?page=2",
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	broker := testSecretBroker{}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	credential := sealMicrosoftCredential(t, broker, domain.CredentialMicrosoftDualToken, domain.MicrosoftCredentialSecret{
+		SchemaVersion:       domain.MicrosoftCredentialSecretVersion,
+		GraphAccessToken:    accessToken,
+		GraphTokenExpiresAt: &expiresAt,
+		GraphScope:          "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+	})
+	adapter := NewMicrosoftAdapter(MicrosoftConfig{
+		GraphBaseURL: server.URL + "/graph", OutlookRESTBaseURL: server.URL + "/rest",
+	}, broker, server.Client())
+	messages, err := adapter.Retrieve(context.Background(), microsoftMailbox(), credential, domain.MessageQuery{
+		RetrievalMethod: domain.RetrievalMicrosoftGraph, RecipientAddress: "alias.a@rainynight.me",
+		Limit: 1, PageSize: 1, MaxPages: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].ID != "alias-match" || graphCalls != 0 || restCalls != 2 {
+		t.Fatalf("messages=%+v graph=%d rest=%d", messages, graphCalls, restCalls)
+	}
+}
+
+func TestMicrosoftGraphUnauthorizedFallsBackToOutlookREST(t *testing.T) {
+	var graphCalls, restCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/graph/"):
+			graphCalls++
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"InvalidAuthenticationToken"}}`))
+		case strings.HasPrefix(r.URL.Path, "/rest/"):
+			restCalls++
+			writeJSON(t, w, map[string]any{"value": []any{graphFixture("rest-message", "primary@outlook.com", nil)}})
+		default:
+			t.Fatalf("unexpected path = %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	broker := testSecretBroker{}
+	credential := sealMicrosoftCredential(t, broker, domain.CredentialMicrosoftGraphOAuth, domain.MicrosoftCredentialSecret{
+		SchemaVersion: domain.MicrosoftCredentialSecretVersion, GraphAccessToken: "access-token", GraphScope: "Mail.Read",
+	})
+	adapter := NewMicrosoftAdapter(MicrosoftConfig{
+		GraphBaseURL: server.URL + "/graph", OutlookRESTBaseURL: server.URL + "/rest",
+	}, broker, server.Client())
+	messages, err := adapter.Retrieve(context.Background(), microsoftMailbox(), credential, domain.MessageQuery{})
+	if err != nil || len(messages) != 1 || messages[0].ID != "rest-message" || graphCalls != 1 || restCalls != 1 {
+		t.Fatalf("messages=%+v graph=%d rest=%d err=%v", messages, graphCalls, restCalls, err)
+	}
+}
+
 func TestMicrosoftErrorsDoNotExposeTokens(t *testing.T) {
 	t.Run("token endpoint", func(t *testing.T) {
 		const refreshToken = "sensitive-refresh-token"
@@ -330,18 +440,22 @@ func TestMicrosoftErrorsDoNotExposeTokens(t *testing.T) {
 
 	t.Run("Graph endpoint", func(t *testing.T) {
 		const accessToken = "sensitive-graph-token"
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = fmt.Fprintf(w, `{"error":{"code":"InvalidAuthenticationToken","message":"bad %s"}}`, accessToken)
+			if strings.HasPrefix(r.URL.Path, "/graph/") {
+				_, _ = fmt.Fprintf(w, `{"error":{"code":"InvalidAuthenticationToken","message":"bad %s"}}`, accessToken)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"error":{"code":"RESTAuthenticationFailed","message":"bad %s"}}`, accessToken)
 		}))
 		t.Cleanup(server.Close)
 		broker := testSecretBroker{}
 		credential := sealMicrosoftCredential(t, broker, domain.CredentialMicrosoftGraphOAuth, domain.MicrosoftCredentialSecret{
 			SchemaVersion: domain.MicrosoftCredentialSecretVersion, GraphAccessToken: accessToken,
 		})
-		adapter := NewMicrosoftAdapter(MicrosoftConfig{GraphBaseURL: server.URL}, broker, server.Client())
+		adapter := NewMicrosoftAdapter(MicrosoftConfig{GraphBaseURL: server.URL + "/graph", OutlookRESTBaseURL: server.URL + "/rest"}, broker, server.Client())
 		_, err := adapter.Retrieve(context.Background(), microsoftMailbox(), credential, domain.MessageQuery{})
-		if err == nil || strings.Contains(err.Error(), accessToken) || !strings.Contains(err.Error(), "InvalidAuthenticationToken") {
+		if err == nil || strings.Contains(err.Error(), accessToken) || !strings.Contains(err.Error(), "RESTAuthenticationFailed") {
 			t.Fatalf("Graph error = %v", err)
 		}
 	})

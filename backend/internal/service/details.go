@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/li-zane/account-manager/backend/internal/domain"
@@ -31,23 +32,28 @@ func (s *MailboxDetailService) SetSettingsReader(settings CredentialRefreshSetti
 }
 
 type CredentialSummary struct {
-	CredentialType       domain.CredentialKind    `json:"credential_type"`
-	ClientID             string                   `json:"client_id,omitempty"`
-	RetrievalMethods     []domain.RetrievalMethod `json:"retrieval_methods,omitempty"`
-	RefreshToken         string                   `json:"refresh_token,omitempty"`
-	HasRefreshToken      bool                     `json:"has_refresh_token"`
-	GraphRefreshToken    string                   `json:"graph_refresh_token,omitempty"`
-	HasGraphRefreshToken bool                     `json:"has_graph_refresh_token"`
-	IMAPRefreshToken     string                   `json:"imap_refresh_token,omitempty"`
-	HasIMAPRefreshToken  bool                     `json:"has_imap_refresh_token"`
-	ExpiresAt            *time.Time               `json:"expires_at,omitempty"`
-	GraphTokenExpiresAt  *time.Time               `json:"graph_token_expires_at,omitempty"`
-	IMAPTokenExpiresAt   *time.Time               `json:"imap_token_expires_at,omitempty"`
-	RefreshAfter         *time.Time               `json:"refresh_after,omitempty"`
-	RefreshStatus        string                   `json:"refresh_status"`
-	LastRefreshedAt      *time.Time               `json:"last_refreshed_at,omitempty"`
-	LastRefreshError     string                   `json:"last_refresh_error,omitempty"`
-	AutoRefresh          bool                     `json:"auto_refresh"`
+	CredentialType        domain.CredentialKind        `json:"credential_type"`
+	ClientID              string                       `json:"client_id,omitempty"`
+	RetrievalMethods      []domain.RetrievalMethod     `json:"retrieval_methods,omitempty"`
+	RetrievalCapabilities []RetrievalCapabilitySummary `json:"retrieval_capabilities,omitempty"`
+	RefreshToken          string                       `json:"refresh_token,omitempty"`
+	HasRefreshToken       bool                         `json:"has_refresh_token"`
+	RefreshTokenValidity  string                       `json:"refresh_token_validity,omitempty"`
+	ExpiresAt             *time.Time                   `json:"expires_at,omitempty"`
+	GraphTokenExpiresAt   *time.Time                   `json:"graph_token_expires_at,omitempty"`
+	IMAPTokenExpiresAt    *time.Time                   `json:"imap_token_expires_at,omitempty"`
+	RefreshAfter          *time.Time                   `json:"refresh_after,omitempty"`
+	RefreshStatus         string                       `json:"refresh_status"`
+	LastRefreshedAt       *time.Time                   `json:"last_refreshed_at,omitempty"`
+	LastRefreshError      string                       `json:"last_refresh_error,omitempty"`
+	AutoRefresh           bool                         `json:"auto_refresh"`
+}
+
+type RetrievalCapabilitySummary struct {
+	Method               domain.RetrievalMethod `json:"method"`
+	Status               string                 `json:"status"`
+	AccessTokenExpiresAt *time.Time             `json:"access_token_expires_at,omitempty"`
+	CheckedAt            *time.Time             `json:"checked_at,omitempty"`
 }
 
 type MailboxDetail struct {
@@ -78,10 +84,6 @@ func (s *MailboxDetailService) Get(ctx context.Context, mailboxID string) (Mailb
 	if err != nil {
 		return MailboxDetail{}, err
 	}
-	credentials, err := s.mailboxes.ListCredentials(ctx, mailboxID)
-	if err != nil {
-		return MailboxDetail{}, err
-	}
 	accounts, err := s.accounts.ListPlatformAccountsByMailbox(ctx, mailboxID, ports.ListOptions{Limit: 500})
 	if err != nil {
 		return MailboxDetail{}, err
@@ -94,9 +96,9 @@ func (s *MailboxDetailService) Get(ctx context.Context, mailboxID string) (Mailb
 		}
 		autoRefresh = settings.Enabled
 	}
-	summaries := make([]CredentialSummary, 0, len(credentials))
-	for _, credential := range credentials {
-		summaries = append(summaries, s.summarizeCredential(ctx, credential, autoRefresh))
+	summaries, err := s.Summaries(ctx, mailboxID, autoRefresh)
+	if err != nil {
+		return MailboxDetail{}, err
 	}
 	detail := MailboxDetail{
 		ID: mailbox.ID, Provider: mailbox.Provider, Address: mailbox.Address,
@@ -112,6 +114,18 @@ func (s *MailboxDetailService) Get(ctx context.Context, mailboxID string) (Mailb
 		detail.RefreshStatus = primary.RefreshStatus
 	}
 	return detail, nil
+}
+
+func (s *MailboxDetailService) Summaries(ctx context.Context, mailboxID string, autoRefresh bool) ([]CredentialSummary, error) {
+	credentials, err := s.mailboxes.ListCredentials(ctx, mailboxID)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]CredentialSummary, 0, len(credentials))
+	for _, credential := range credentials {
+		summaries = append(summaries, s.summarizeCredential(ctx, credential, autoRefresh))
+	}
+	return summaries, nil
 }
 
 func (s *MailboxDetailService) summarizeCredential(ctx context.Context, credential domain.MailboxCredential, autoRefresh bool) CredentialSummary {
@@ -131,14 +145,6 @@ func (s *MailboxDetailService) summarizeCredential(ctx context.Context, credenti
 		summary.GraphTokenExpiresAt = secret.GraphTokenExpiresAt
 		summary.IMAPTokenExpiresAt = secret.IMAPTokenExpiresAt
 		summary.ExpiresAt = credentialSummaryExpiry(credential, secret)
-		summary.HasGraphRefreshToken = secret.GraphRefreshToken != ""
-		summary.HasIMAPRefreshToken = secret.IMAPRefreshToken != ""
-		if summary.HasGraphRefreshToken {
-			summary.GraphRefreshToken = maskedCredentialValue
-		}
-		if summary.HasIMAPRefreshToken {
-			summary.IMAPRefreshToken = maskedCredentialValue
-		}
 		if primaryRefreshToken(credential.Kind, secret) != "" {
 			summary.HasRefreshToken = true
 			summary.RefreshToken = maskedCredentialValue
@@ -147,20 +153,22 @@ func (s *MailboxDetailService) summarizeCredential(ctx context.Context, credenti
 	if summary.RefreshStatus == "" || summary.RefreshStatus == "unknown" {
 		summary.RefreshStatus = derivedRefreshStatus(s.clock().UTC(), credential, refreshCredentialComplete(credential.Kind, secret), err)
 	}
+	summary.RefreshTokenValidity = refreshTokenValidity(credential.Kind, summary.HasRefreshToken, summary.RefreshStatus)
+	summary.RetrievalCapabilities = retrievalCapabilities(s.clock().UTC(), credential, summary, secret, err)
 	return summary
 }
 
 type RevealedCredential struct {
-	ClientID            string                   `json:"client_id,omitempty"`
-	RefreshToken        string                   `json:"refresh_token"`
-	GraphRefreshToken   string                   `json:"graph_refresh_token,omitempty"`
-	IMAPRefreshToken    string                   `json:"imap_refresh_token,omitempty"`
-	CredentialType      domain.CredentialKind    `json:"credential_type"`
-	RetrievalMethods    []domain.RetrievalMethod `json:"retrieval_methods,omitempty"`
-	ExpiresAt           *time.Time               `json:"expires_at,omitempty"`
-	GraphTokenExpiresAt *time.Time               `json:"graph_token_expires_at,omitempty"`
-	IMAPTokenExpiresAt  *time.Time               `json:"imap_token_expires_at,omitempty"`
-	RevealedUntil       time.Time                `json:"revealed_until"`
+	ClientID              string                       `json:"client_id,omitempty"`
+	RefreshToken          string                       `json:"refresh_token"`
+	CredentialType        domain.CredentialKind        `json:"credential_type"`
+	RetrievalMethods      []domain.RetrievalMethod     `json:"retrieval_methods,omitempty"`
+	RetrievalCapabilities []RetrievalCapabilitySummary `json:"retrieval_capabilities,omitempty"`
+	RefreshTokenValidity  string                       `json:"refresh_token_validity,omitempty"`
+	ExpiresAt             *time.Time                   `json:"expires_at,omitempty"`
+	GraphTokenExpiresAt   *time.Time                   `json:"graph_token_expires_at,omitempty"`
+	IMAPTokenExpiresAt    *time.Time                   `json:"imap_token_expires_at,omitempty"`
+	RevealedUntil         time.Time                    `json:"revealed_until"`
 }
 
 func (s *MailboxDetailService) Reveal(ctx context.Context, mailboxID string, kind domain.CredentialKind) (RevealedCredential, error) {
@@ -202,10 +210,11 @@ func (s *MailboxDetailService) Reveal(ctx context.Context, mailboxID string, kin
 	if clientID == "" {
 		clientID = secret.ClientID
 	}
+	summary := s.summarizeCredential(ctx, credential, false)
 	return RevealedCredential{
 		ClientID: clientID, RefreshToken: refreshToken,
-		GraphRefreshToken: secret.GraphRefreshToken, IMAPRefreshToken: secret.IMAPRefreshToken,
 		CredentialType: credential.Kind, RetrievalMethods: credentialRetrievalMethods(credential.Kind),
+		RetrievalCapabilities: summary.RetrievalCapabilities, RefreshTokenValidity: summary.RefreshTokenValidity,
 		ExpiresAt:           credentialSummaryExpiry(credential, secret),
 		GraphTokenExpiresAt: secret.GraphTokenExpiresAt, IMAPTokenExpiresAt: secret.IMAPTokenExpiresAt,
 		RevealedUntil: s.clock().UTC().Add(60 * time.Second),
@@ -217,8 +226,8 @@ const maskedCredentialValue = "********"
 type openedMailboxCredential struct {
 	ClientID            string
 	RefreshToken        string
-	GraphRefreshToken   string
-	IMAPRefreshToken    string
+	GraphAccessToken    bool
+	IMAPAccessToken     bool
 	GraphTokenExpiresAt *time.Time
 	IMAPTokenExpiresAt  *time.Time
 }
@@ -249,29 +258,50 @@ func (s *MailboxDetailService) openMailboxSecret(ctx context.Context, credential
 		secret.RefreshToken = microsoft.RefreshToken
 		switch credential.Kind {
 		case domain.CredentialMicrosoftGraphOAuth:
-			secret.GraphRefreshToken = firstCredentialValue(microsoft.GraphRefreshToken, microsoft.RefreshToken)
-			secret.GraphTokenExpiresAt = microsoftTokenExpiry(microsoft.GraphTokenExpiresAt, microsoft, domain.RetrievalMicrosoftGraph, credential.ExpiresAt)
+			secret.RefreshToken = firstCredentialValue(microsoft.RefreshToken, microsoft.GraphRefreshToken)
+			secret.GraphAccessToken = microsoftGraphAccessTokenPresent(microsoft)
+			if secret.GraphAccessToken {
+				secret.GraphTokenExpiresAt = microsoftTokenExpiry(microsoft.GraphTokenExpiresAt, microsoft, domain.RetrievalMicrosoftGraph, credential.ExpiresAt)
+			}
 		case domain.CredentialMicrosoftIMAPOAuth:
-			secret.IMAPRefreshToken = firstCredentialValue(microsoft.IMAPRefreshToken, microsoft.RefreshToken)
-			secret.IMAPTokenExpiresAt = microsoftTokenExpiry(microsoft.IMAPTokenExpiresAt, microsoft, domain.RetrievalIMAPOAuth, credential.ExpiresAt)
+			secret.RefreshToken = firstCredentialValue(microsoft.RefreshToken, microsoft.IMAPRefreshToken)
+			secret.IMAPAccessToken = microsoftIMAPAccessTokenPresent(microsoft)
+			if secret.IMAPAccessToken {
+				secret.IMAPTokenExpiresAt = microsoftTokenExpiry(microsoft.IMAPTokenExpiresAt, microsoft, domain.RetrievalIMAPOAuth, credential.ExpiresAt)
+			}
 		case domain.CredentialMicrosoftDualToken:
-			secret.GraphRefreshToken = firstCredentialValue(microsoft.GraphRefreshToken, microsoft.RefreshToken)
-			secret.IMAPRefreshToken = firstCredentialValue(microsoft.IMAPRefreshToken, microsoft.RefreshToken)
-			secret.GraphTokenExpiresAt = microsoftTokenExpiry(microsoft.GraphTokenExpiresAt, microsoft, domain.RetrievalMicrosoftGraph, credential.ExpiresAt)
-			secret.IMAPTokenExpiresAt = microsoftTokenExpiry(microsoft.IMAPTokenExpiresAt, microsoft, domain.RetrievalIMAPOAuth, credential.ExpiresAt)
+			secret.RefreshToken = firstCredentialValue(microsoft.RefreshToken, microsoft.GraphRefreshToken, microsoft.IMAPRefreshToken)
+			secret.GraphAccessToken = microsoftGraphAccessTokenPresent(microsoft)
+			secret.IMAPAccessToken = microsoftIMAPAccessTokenPresent(microsoft)
+			if secret.GraphAccessToken {
+				secret.GraphTokenExpiresAt = microsoftTokenExpiry(microsoft.GraphTokenExpiresAt, microsoft, domain.RetrievalMicrosoftGraph, credential.ExpiresAt)
+			}
+			if secret.IMAPAccessToken {
+				secret.IMAPTokenExpiresAt = microsoftTokenExpiry(microsoft.IMAPTokenExpiresAt, microsoft, domain.RetrievalIMAPOAuth, credential.ExpiresAt)
+			}
 		}
 	}
 	return secret, nil
 }
 
+func microsoftGraphAccessTokenPresent(secret domain.MicrosoftCredentialSecret) bool {
+	return strings.TrimSpace(secret.GraphAccessToken) != "" ||
+		((secret.AccessTokenMethod == domain.RetrievalMicrosoftGraph || secret.AccessTokenMethod == domain.RetrievalOutlookREST) && strings.TrimSpace(secret.AccessToken) != "")
+}
+
+func microsoftIMAPAccessTokenPresent(secret domain.MicrosoftCredentialSecret) bool {
+	return strings.TrimSpace(secret.IMAPAccessToken) != "" ||
+		(secret.AccessTokenMethod == domain.RetrievalIMAPOAuth && strings.TrimSpace(secret.AccessToken) != "")
+}
+
 func credentialRetrievalMethods(kind domain.CredentialKind) []domain.RetrievalMethod {
 	switch kind {
 	case domain.CredentialMicrosoftGraphOAuth:
-		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph}
+		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST}
 	case domain.CredentialMicrosoftIMAPOAuth:
 		return []domain.RetrievalMethod{domain.RetrievalIMAPOAuth}
 	case domain.CredentialMicrosoftDualToken:
-		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth}
+		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth}
 	case domain.CredentialGmailOAuth:
 		return []domain.RetrievalMethod{domain.RetrievalGmailAPI}
 	case domain.CredentialIMAPPassword:
@@ -282,25 +312,13 @@ func credentialRetrievalMethods(kind domain.CredentialKind) []domain.RetrievalMe
 }
 
 func primaryRefreshToken(kind domain.CredentialKind, secret openedMailboxCredential) string {
-	switch kind {
-	case domain.CredentialMicrosoftGraphOAuth, domain.CredentialMicrosoftDualToken:
-		return firstCredentialValue(secret.GraphRefreshToken, secret.IMAPRefreshToken, secret.RefreshToken)
-	case domain.CredentialMicrosoftIMAPOAuth:
-		return firstCredentialValue(secret.IMAPRefreshToken, secret.RefreshToken)
-	default:
-		return secret.RefreshToken
-	}
+	return secret.RefreshToken
 }
 
 func refreshCredentialComplete(kind domain.CredentialKind, secret openedMailboxCredential) bool {
 	switch kind {
-	case domain.CredentialMicrosoftGraphOAuth:
-		return secret.GraphRefreshToken != ""
-	case domain.CredentialMicrosoftIMAPOAuth:
-		return secret.IMAPRefreshToken != ""
-	case domain.CredentialMicrosoftDualToken:
-		return secret.GraphRefreshToken != "" && secret.IMAPRefreshToken != ""
-	case domain.CredentialGmailOAuth:
+	case domain.CredentialMicrosoftGraphOAuth, domain.CredentialMicrosoftIMAPOAuth,
+		domain.CredentialMicrosoftDualToken, domain.CredentialGmailOAuth:
 		return secret.RefreshToken != ""
 	default:
 		return false
@@ -392,4 +410,96 @@ func derivedRefreshStatus(now time.Time, credential domain.MailboxCredential, ha
 		return "active"
 	}
 	return "missing"
+}
+
+type retrievalVerificationRecord struct {
+	Status    string     `json:"status"`
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
+}
+
+type credentialOperationalMetadata struct {
+	RetrievalVerification map[string]retrievalVerificationRecord `json:"retrieval_verification,omitempty"`
+}
+
+func refreshTokenValidity(kind domain.CredentialKind, hasRefreshToken bool, refreshStatus string) string {
+	if !refreshableCredential(kind) {
+		return "not_applicable"
+	}
+	switch strings.ToLower(strings.TrimSpace(refreshStatus)) {
+	case "error", "unreadable":
+		return "error"
+	}
+	if hasRefreshToken {
+		return "no_fixed_expiry"
+	}
+	return "missing"
+}
+
+func retrievalCapabilities(now time.Time, credential domain.MailboxCredential, summary CredentialSummary, secret openedMailboxCredential, openErr error) []RetrievalCapabilitySummary {
+	records := retrievalVerificationRecords(credential.Metadata)
+	capabilities := make([]RetrievalCapabilitySummary, 0, len(summary.RetrievalMethods))
+	for _, method := range summary.RetrievalMethods {
+		capability := RetrievalCapabilitySummary{Method: method, Status: "unknown"}
+		switch method {
+		case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
+			capability.AccessTokenExpiresAt = copyCredentialTime(secret.GraphTokenExpiresAt)
+		case domain.RetrievalIMAPOAuth:
+			capability.AccessTokenExpiresAt = copyCredentialTime(secret.IMAPTokenExpiresAt)
+		case domain.RetrievalGmailAPI:
+			capability.AccessTokenExpiresAt = copyCredentialTime(summary.ExpiresAt)
+		}
+		if record, ok := records[string(method)]; ok && validRetrievalCapabilityStatus(record.Status) {
+			capability.Status = record.Status
+			capability.CheckedAt = copyCredentialTime(record.CheckedAt)
+		} else if openErr != nil && !errors.Is(openErr, domain.ErrNotFound) {
+			capability.Status = "failed"
+		} else if retrievalMethodRefreshFailed(credential.LastRefreshError, method) {
+			capability.Status = "failed"
+		} else if summary.HasRefreshToken || credential.Kind == domain.CredentialIMAPPassword {
+			capability.Status = "configured"
+		}
+		if capability.Status == "verified" && capability.AccessTokenExpiresAt != nil && !capability.AccessTokenExpiresAt.After(now) {
+			// Channel verification remains valid evidence after a short-lived AT expires.
+			capability.AccessTokenExpiresAt = copyCredentialTime(capability.AccessTokenExpiresAt)
+		}
+		capabilities = append(capabilities, capability)
+	}
+	return capabilities
+}
+
+func retrievalVerificationRecords(metadata json.RawMessage) map[string]retrievalVerificationRecord {
+	if len(metadata) == 0 || !json.Valid(metadata) {
+		return nil
+	}
+	var operational credentialOperationalMetadata
+	if err := json.Unmarshal(metadata, &operational); err != nil {
+		return nil
+	}
+	return operational.RetrievalVerification
+}
+
+func validRetrievalCapabilityStatus(status string) bool {
+	switch status {
+	case "configured", "verified", "failed", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func retrievalMethodRefreshFailed(message string, method domain.RetrievalMethod) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	if message == "" {
+		return false
+	}
+	switch method {
+	case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
+		return strings.Contains(message, "graph") || strings.Contains(message, "outlook")
+	case domain.RetrievalIMAPOAuth, domain.RetrievalIMAPPassword:
+		return strings.Contains(message, "imap")
+	case domain.RetrievalGmailAPI:
+		return strings.Contains(message, "gmail") || strings.Contains(message, "google")
+	default:
+		return false
+	}
 }

@@ -73,6 +73,13 @@ type PickupKeyRepository interface {
 	ListPickupKeys(ctx context.Context, mailboxID string, options ListOptions) ([]domain.MailboxPickupKey, error)
 }
 
+type MessageCacheRepository interface {
+	UpsertCachedMessages(ctx context.Context, messages []domain.CachedMessage) (int, error)
+	ListCachedMessages(ctx context.Context, mailboxID string, folder domain.MessageFolder, recipientAddress string, options ListOptions) ([]domain.CachedMessage, error)
+	GetMessageSyncState(ctx context.Context, targetID string, folder domain.MessageFolder) (domain.MessageSyncState, error)
+	SaveMessageSyncState(ctx context.Context, state domain.MessageSyncState) error
+}
+
 type PlatformAccountRepository interface {
 	CreatePlatformAccount(ctx context.Context, account domain.PlatformAccount) error
 	GetPlatformAccount(ctx context.Context, id string) (domain.PlatformAccount, error)
@@ -124,6 +131,7 @@ type Store interface {
 	MailboxRepository
 	MailboxFormatRepository
 	PickupKeyRepository
+	MessageCacheRepository
 	PlatformAccountRepository
 	BackupRepository
 	BackupRunClaimer

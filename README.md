@@ -7,7 +7,7 @@ coupling platform accounts to a single mailbox provider.
 
 ## Current Scope
 
-- Microsoft mailboxes through Graph and IMAP OAuth, including dual-token refresh.
+- Microsoft mailboxes through one shared RT with Graph/REST and IMAP OAuth retrieval channels.
 - Gmail through Gmail API and IMAP OAuth.
 - Cloudflare Email Routing aliases forwarded to managed destination mailboxes.
 - Primary mailboxes with expandable split/forwarding addresses and exact-recipient filtering.

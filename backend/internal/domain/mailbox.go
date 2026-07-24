@@ -111,15 +111,18 @@ type MailboxRoute struct {
 	Address   string `json:"address"`
 }
 
-// MailboxPickupKey stores only the keyed digest and a display prefix. The raw
-// token is returned once by the service and has no persistence field.
+// MailboxPickupKey keeps a keyed digest for authentication. EncryptedToken is
+// optional legacy-compatible storage used only for explicit administrator
+// exports and is never serialized by mailbox APIs.
 type MailboxPickupKey struct {
-	ID        string     `json:"id"`
-	MailboxID string     `json:"mailbox_id"`
-	Digest    []byte     `json:"-"`
-	Prefix    string     `json:"prefix"`
-	Label     string     `json:"label,omitempty"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
+	ID             string     `json:"id"`
+	MailboxID      string     `json:"mailbox_id"`
+	Digest         []byte     `json:"-"`
+	EncryptedToken []byte     `json:"-"`
+	KeyVersion     string     `json:"-"`
+	Prefix         string     `json:"prefix"`
+	Label          string     `json:"label,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	RevokedAt      *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
