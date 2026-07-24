@@ -1,0 +1,71 @@
+name: account-manager
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${ACCOUNT_MANAGER_POSTGRES_DB:-account_manager}
+      POSTGRES_USER: ${ACCOUNT_MANAGER_POSTGRES_USER:-account_manager}
+      POSTGRES_PASSWORD: ${ACCOUNT_MANAGER_POSTGRES_PASSWORD:?set ACCOUNT_MANAGER_POSTGRES_PASSWORD}
+    volumes:
+      - account-manager-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://${ACCOUNT_MANAGER_POSTGRES_USER:-account_manager}:${ACCOUNT_MANAGER_POSTGRES_PASSWORD}@postgres:5432/${ACCOUNT_MANAGER_POSTGRES_DB:-account_manager}?sslmode=disable
+      APP_ENCRYPTION_KEY_BASE64: ${APP_ENCRYPTION_KEY_BASE64:?set APP_ENCRYPTION_KEY_BASE64}
+      PICKUP_KEY_PEPPER_BASE64: ${PICKUP_KEY_PEPPER_BASE64:?set PICKUP_KEY_PEPPER_BASE64}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?set ADMIN_API_TOKEN}
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_ZONE_NAME: ${CLOUDFLARE_ZONE_NAME:-}
+      CLOUDFLARE_API_BASE_URL: ${CLOUDFLARE_API_BASE_URL:-}
+      MICROSOFT_TOKEN_ENDPOINT: ${MICROSOFT_TOKEN_ENDPOINT:-}
+      MICROSOFT_GRAPH_BASE_URL: ${MICROSOFT_GRAPH_BASE_URL:-}
+      GOOGLE_TOKEN_ENDPOINT: ${GOOGLE_TOKEN_ENDPOINT:-}
+      GMAIL_API_BASE_URL: ${GMAIL_API_BASE_URL:-}
+      TOKEN_REFRESH_WORKER_ENABLED: ${TOKEN_REFRESH_WORKER_ENABLED:-true}
+      TOKEN_REFRESH_WORKER_INTERVAL: ${TOKEN_REFRESH_WORKER_INTERVAL:-1m}
+      TOKEN_REFRESH_WORKER_CONCURRENCY: ${TOKEN_REFRESH_WORKER_CONCURRENCY:-4}
+      TOKEN_REFRESH_WORKER_ITEM_TIMEOUT: ${TOKEN_REFRESH_WORKER_ITEM_TIMEOUT:-45s}
+      TOKEN_REFRESH_WORKER_ERROR_BACKOFF: ${TOKEN_REFRESH_WORKER_ERROR_BACKOFF:-15m}
+      BACKUP_WORKER_ENABLED: ${BACKUP_WORKER_ENABLED:-true}
+      BACKUP_WORKER_POLL_INTERVAL: ${BACKUP_WORKER_POLL_INTERVAL:-2s}
+      BACKUP_SCHEDULER_INTERVAL: ${BACKUP_SCHEDULER_INTERVAL:-30s}
+      PG_DUMP_PATH: ${PG_DUMP_PATH:-pg_dump}
+      PG_RESTORE_PATH: ${PG_RESTORE_PATH:-pg_restore}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?set ADMIN_API_TOKEN}
+    ports:
+      - "127.0.0.1:${ACCOUNT_MANAGER_HTTP_PORT:-18019}:80"
+    restart: unless-stopped
+
+volumes:
+  account-manager-postgres-data:
