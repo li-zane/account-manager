@@ -1,0 +1,30 @@
+# Findings
+
+- The local PostgreSQL refresh setting and ignored `.env` worker switch are already disabled.
+- `MessageRetrievalService.Retrieve` still calls `ensureFreshCredential` and can force refresh after `ErrUnauthorized` without consulting settings.
+- `MailboxDetailService` publicly exposes generic, Graph, and IMAP refresh-token fields even though Microsoft uses one shared RT.
+- Existing real-data validation completed before this change; this session must use only local structural and automated tests.
+- New scope requires a durable mail cache with inbox/junk views and incremental/manual/periodic synchronization.
+- Forwarding-recipient information belongs only to domain-routing mailboxes, not Outlook mailboxes.
+- Existing pickup keys are digest-only, so format export requires a separately encrypted token copy; plaintext storage is not acceptable.
+- Pickup-key issuance must become an idempotent mailbox lifecycle operation instead of a row action.
+- The overview endpoint currently derives access modes only from the mailbox provider, so every Microsoft mailbox is presented as if the same capabilities were confirmed.
+- The detail endpoint derives retrieval methods from credential kind and the React drawer labels each method as configured; neither layer distinguishes configured, verified, failed, and unknown.
+- Microsoft RTs generally do not expose a fixed expiry timestamp. Stored Graph/IMAP expiry values are access-token lifetimes and must not populate the RT expiry column.
+- A method-specific cached access token with an expiry is usable evidence of prior channel verification without issuing a new network request; credential kind alone is only configuration evidence.
+- Xinlan's public product/help pages describe the relevant mailbox-management baseline as bulk import/validation/login/retrieval/export, INBOX plus junk/all-folder IMAP retrieval, scheduled polling, local mail storage, sender/subject/body search and extraction, custom servers/proxies, and an HTTP API. Account Manager already covers the provider-neutral API, imports/exports, cached polling, and folder viewing; local search and explicit channel verification state are the immediate UI gaps.
+- Xinlan accepts Microsoft address/password/client-id/refresh-token imports and treats Microsoft token login separately from normal POP3/IMAP passwords. This matches Account Manager's canonical shared RT plus capability labels; it does not justify modeling two independent RT strings.
+- The local database contains five Microsoft primary mailboxes and two aliases. All five credential rows are `microsoft_dual_token`, so all five are configured for the shared-RT dual-channel model; prior redacted live results were Graph/REST 5/5 and IMAP 4/5, so configuration must not be presented as universal per-mailbox verification.
+- The persisted token-refresh setting is `enabled=false`, and the process kill switch is also disabled in `.env`.
+- Recording every retrieval result on `mailbox_credentials` conflicts with that row's token-refresh optimistic version. Per-channel operational verification needs its own status record; credential metadata is read-compatible, but retrieval does not mutate it in this change.
+- Migrations 5 and 6 applied successfully. All five Microsoft mailboxes now have an active exportable encrypted pickup-key copy.
+- Read-only API inspection confirms all five imported Microsoft fixtures use `microsoft_dual_token`, contain one shared RT, expose Graph/REST/IMAP as configured capabilities, and keep automatic refresh disabled.
+- All five Graph and IMAP short-lived AT expiry fields are populated but currently expired. These timestamps are channel-specific AT evidence, not RT expiry dates.
+- Desktop browser inspection at 1440x900 confirms that the mailbox address itself is a button, the table shows Graph/IMAP, aliases remain expanded under their parent, and RT status reads `no fixed expiry` without inventing an expiration date.
+- Browser interaction confirms clicking an address writes the exact address to the clipboard and shows a visible copy-success toast. The row-scoped details action resolves uniquely and opens the Outlook detail drawer.
+- Desktop detail inspection confirms one masked shared RT, automatic refresh off, Microsoft RT `no fixed expiry`, and exactly three configured retrieval capabilities: Graph, Outlook REST, and IMAP. Each capability renders its own short-lived AT timestamp; the drawer stays within the viewport and introduces no page-level horizontal overflow.
+- At 390x844 the app switches to mailbox cards, keeps all seven visible primary/alias records, preserves clickable wrapped addresses and fixed bottom navigation, and has no page-level horizontal overflow.
+- The 390px detail drawer renders the shared RT and all three channels. Its first animation frame temporarily extends the transformed box; after the 220ms transition it settles exactly at `left=0`, `right=390`, with `scrollWidth=390` and no horizontal overflow.
+- The cached inbox opens without upstream retrieval. At 390px it exposes Auto/Graph/IMAP channel controls, INBOX/Junk tabs, a manual pull button, cache status, and local search. Switching to IMAP and Junk and filling a search query updates local UI state without invoking the pull action.
+- Per-mailbox export opens with exactly one main mailbox selected. The default universal format is `Email and platform pickup key`, automatically locks sensitive export on because the pickup key is required, and previews `邮箱----[由服务端导出]`; Microsoft-only Outlook four-part is also listed.
+- Automatic pickup-key issuance now coalesces concurrent calls per mailbox and migration 7 adds a cross-instance partial unique index. The local database reports zero duplicate active encrypted automatic keys and still has one exportable key for each of the five Microsoft mailboxes.
