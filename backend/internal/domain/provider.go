@@ -9,7 +9,6 @@ type RetrievalMethod string
 
 const (
 	RetrievalMicrosoftGraph RetrievalMethod = "microsoft_graph"
-	RetrievalOutlookREST    RetrievalMethod = "outlook_rest"
 	RetrievalIMAPOAuth      RetrievalMethod = "imap_oauth"
 	RetrievalIMAPPassword   RetrievalMethod = "imap_password"
 	RetrievalDualToken      RetrievalMethod = "dual_token"
@@ -68,6 +67,7 @@ const (
 
 type MessageQuery struct {
 	After            *time.Time
+	Before           *time.Time
 	Limit            int
 	Unread           bool
 	Folder           MessageFolder
@@ -75,6 +75,27 @@ type MessageQuery struct {
 	RetrievalMethod  RetrievalMethod
 	PageSize         int
 	MaxPages         int
+}
+
+type MessageSyncRequest struct {
+	Method      RetrievalMethod
+	Folder      MessageFolder
+	Cursor      string
+	UIDValidity uint32
+	HighestUID  uint32
+	Limit       int
+	PageSize    int
+	MaxPages    int
+}
+
+type MessageSyncResult struct {
+	Method                    RetrievalMethod
+	Messages                  []Message
+	DeletedProviderMessageIDs []string
+	Cursor                    string
+	UIDValidity               uint32
+	HighestUID                uint32
+	Complete                  bool
 }
 
 type Message struct {

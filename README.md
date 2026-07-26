@@ -7,8 +7,11 @@ coupling platform accounts to a single mailbox provider.
 
 ## Current Scope
 
-- Microsoft mailboxes through one shared RT with Graph/REST and IMAP OAuth retrieval channels.
+- Microsoft mailboxes through one shared RT with Graph and IMAP OAuth retrieval channels.
 - Gmail through Gmail API and IMAP OAuth.
+- Full first-import mailbox backfill followed by Graph delta, IMAP UID, or overlapping time-window incremental synchronization.
+- Durable mail cache with Settings-based query, CSV export, bounded recovery, and explicit range deletion.
+- Complete HTML mail reading with inline images, retrieval metadata, address copying, and verification-code extraction.
 - Cloudflare Email Routing aliases forwarded to managed destination mailboxes.
 - Primary mailboxes with expandable split/forwarding addresses and exact-recipient filtering.
 - Independent ChatGPT, Grok, and future platform-account identities routed by mailbox ID.

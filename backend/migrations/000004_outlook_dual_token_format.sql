@@ -1,5 +1,5 @@
 -- Outlook four-part records contain a shared Microsoft refresh-token chain.
--- Import them as dual credentials so Graph/Outlook REST and IMAP can be
+-- Import them as dual credentials so Microsoft Graph and IMAP can be
 -- selected independently without changing the external four-field format.
 
 UPDATE mailbox_formats

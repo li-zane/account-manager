@@ -177,6 +177,37 @@ func TestNormalizeIMAPMessageRetainsRepeatedEnvelopeHeaders(t *testing.T) {
 	}
 }
 
+func TestNormalizeIMAPMessageEmbedsInlineCIDImage(t *testing.T) {
+	raw := strings.Join([]string{
+		"From: sender@example.test",
+		"To: receiver@example.test",
+		"Subject: inline image",
+		"Message-ID: <inline@example.test>",
+		"Content-Type: multipart/related; boundary=related-boundary",
+		"",
+		"--related-boundary",
+		"Content-Type: text/html; charset=utf-8",
+		"",
+		`<p>body<img src="cid:logo-1"></p>`,
+		"--related-boundary",
+		"Content-Type: image/png",
+		"Content-Transfer-Encoding: base64",
+		"Content-ID: <logo-1>",
+		"Content-Disposition: inline",
+		"",
+		"aW1hZ2U=",
+		"--related-boundary--",
+		"",
+	}, "\r\n")
+	message, err := normalizeIMAPMessage(7, nil, time.Now(), strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(message.HTML, "data:image/png;base64,aW1hZ2U=") || strings.Contains(message.HTML, "cid:logo-1") {
+		t.Fatalf("inline image was not embedded: %q", message.HTML)
+	}
+}
+
 func TestGmailIMAPCredentialUsesInjectedRetriever(t *testing.T) {
 	broker := gmailTestSecretBroker{}
 	credential := sealGmailCredential(t, broker, GmailCredentialSecret{Username: "route@gmail.com", Password: "app-password"})

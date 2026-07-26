@@ -22,23 +22,24 @@ type Store struct {
 	mu                sync.RWMutex
 	backupOperationMu sync.Mutex
 
-	providerConnections map[string]domain.ProviderConnection
-	providerByIdentity  map[string]string
-	appSettings         map[string]domain.AppSetting
-	mailboxes           map[string]domain.Mailbox
-	mailboxByIdentity   map[string]string
-	aliases             map[string]domain.MailboxAlias
-	aliasByIdentity     map[string]string
-	credentials         map[string]domain.MailboxCredential
-	pickupKeys          map[string]domain.MailboxPickupKey
-	pickupByDigest      map[string]string
-	cachedMessages      map[string]domain.CachedMessage
-	messageSyncStates   map[string]domain.MessageSyncState
-	accounts            map[string]domain.PlatformAccount
-	platformCredentials map[string]domain.PlatformAccountCredential
-	formats             map[string]domain.MailboxFormat
-	backupTargets       map[string]domain.BackupTarget
-	backupRuns          map[string]domain.BackupRun
+	providerConnections   map[string]domain.ProviderConnection
+	providerByIdentity    map[string]string
+	appSettings           map[string]domain.AppSetting
+	mailboxes             map[string]domain.Mailbox
+	mailboxByIdentity     map[string]string
+	aliases               map[string]domain.MailboxAlias
+	aliasByIdentity       map[string]string
+	credentials           map[string]domain.MailboxCredential
+	pickupKeys            map[string]domain.MailboxPickupKey
+	pickupByDigest        map[string]string
+	cachedMessages        map[string]domain.CachedMessage
+	messageSyncStates     map[string]domain.MessageSyncState
+	retrievalCapabilities map[string]domain.MailboxRetrievalCapability
+	accounts              map[string]domain.PlatformAccount
+	platformCredentials   map[string]domain.PlatformAccountCredential
+	formats               map[string]domain.MailboxFormat
+	backupTargets         map[string]domain.BackupTarget
+	backupRuns            map[string]domain.BackupRun
 }
 
 func New() *Store {
@@ -60,20 +61,21 @@ func New() *Store {
 				Version: 1, UpdatedAt: now,
 			},
 		},
-		mailboxes:           make(map[string]domain.Mailbox),
-		mailboxByIdentity:   make(map[string]string),
-		aliases:             make(map[string]domain.MailboxAlias),
-		aliasByIdentity:     make(map[string]string),
-		credentials:         make(map[string]domain.MailboxCredential),
-		pickupKeys:          make(map[string]domain.MailboxPickupKey),
-		pickupByDigest:      make(map[string]string),
-		cachedMessages:      make(map[string]domain.CachedMessage),
-		messageSyncStates:   make(map[string]domain.MessageSyncState),
-		accounts:            make(map[string]domain.PlatformAccount),
-		platformCredentials: make(map[string]domain.PlatformAccountCredential),
-		formats:             make(map[string]domain.MailboxFormat),
-		backupTargets:       make(map[string]domain.BackupTarget),
-		backupRuns:          make(map[string]domain.BackupRun),
+		mailboxes:             make(map[string]domain.Mailbox),
+		mailboxByIdentity:     make(map[string]string),
+		aliases:               make(map[string]domain.MailboxAlias),
+		aliasByIdentity:       make(map[string]string),
+		credentials:           make(map[string]domain.MailboxCredential),
+		pickupKeys:            make(map[string]domain.MailboxPickupKey),
+		pickupByDigest:        make(map[string]string),
+		cachedMessages:        make(map[string]domain.CachedMessage),
+		messageSyncStates:     make(map[string]domain.MessageSyncState),
+		retrievalCapabilities: make(map[string]domain.MailboxRetrievalCapability),
+		accounts:              make(map[string]domain.PlatformAccount),
+		platformCredentials:   make(map[string]domain.PlatformAccountCredential),
+		formats:               make(map[string]domain.MailboxFormat),
+		backupTargets:         make(map[string]domain.BackupTarget),
+		backupRuns:            make(map[string]domain.BackupRun),
 	}
 }
 

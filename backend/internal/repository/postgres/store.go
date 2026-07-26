@@ -654,7 +654,7 @@ func mapError(err error) error {
 		case "23503":
 			return fmt.Errorf("%w: related record does not exist", domain.ErrInvalid)
 		case "23514", "23502", "22P02":
-			return fmt.Errorf("%w: database constraint %s", domain.ErrInvalid, pgErr.ConstraintName)
+			return fmt.Errorf("%w: database value rejected (code %s, column %s, constraint %s)", domain.ErrInvalid, pgErr.Code, pgErr.ColumnName, pgErr.ConstraintName)
 		}
 	}
 	return err

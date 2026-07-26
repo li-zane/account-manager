@@ -83,7 +83,7 @@ variables above are operational limits and an optional process-level kill
 switch; the UI setting remains the normal control.
 
 Microsoft dual-channel credentials use one canonical rotating RT shared by
-Graph/REST and IMAP. Legacy split Graph/IMAP RT fields remain read-compatible
+Graph and IMAP. Legacy split Graph/IMAP RT fields remain read-compatible
 and are collapsed into the canonical chain on the next successful refresh.
 Refresh runs Graph first, applies any rotated RT, seals a durable checkpoint,
 and then refreshes IMAP with the current RT. If the IMAP call fails, the service

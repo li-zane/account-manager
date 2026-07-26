@@ -68,9 +68,9 @@ function inferCredential(mailbox: MailboxRecord): MailboxCredentialSummary {
           ? 'microsoft_graph_oauth'
           : 'imap_password'
   const methods = credentialType === 'microsoft_dual_token'
-    ? ['microsoft_graph', 'outlook_rest', 'imap_oauth']
+    ? ['microsoft_graph', 'imap_oauth']
     : credentialType === 'microsoft_graph_oauth'
-      ? ['microsoft_graph', 'outlook_rest']
+      ? ['microsoft_graph']
       : credentialType === 'microsoft_imap_oauth'
         ? ['imap_oauth']
         : []
@@ -111,7 +111,6 @@ function MaskedValue({ value, fallback = '未同步' }: { value?: string; fallba
 
 const retrievalMethodLabels: Record<string, string> = {
   microsoft_graph: 'Graph',
-  outlook_rest: 'Outlook REST',
   imap_oauth: 'IMAP',
   gmail_api: 'Gmail API',
   imap_password: 'IMAP',
@@ -132,7 +131,7 @@ function credentialCapabilities(credential: MailboxCredentialSummary, revealed?:
     status: 'unknown',
     accessTokenExpiresAt: method === 'imap_oauth'
       ? revealed?.imapTokenExpiresAt || credential.imapTokenExpiresAt
-      : method === 'microsoft_graph' || method === 'outlook_rest'
+      : method === 'microsoft_graph'
         ? revealed?.graphTokenExpiresAt || credential.graphTokenExpiresAt
         : revealed?.expiresAt || credential.expiresAt,
   }))
@@ -141,8 +140,8 @@ function credentialCapabilities(credential: MailboxCredentialSummary, revealed?:
 function rtValidityLabel(mailbox: MailboxRecord, credential: MailboxCredentialSummary): string {
   if (credential.credentialType === 'imap_password') return '不适用'
   if (!credential.hasRefreshToken || credential.refreshTokenValidity === 'missing') return '未配置'
-  if (credential.refreshTokenValidity === 'error') return '状态异常，未提供固定到期日'
-  return mailbox.provider === 'microsoft' ? '微软未提供固定到期日' : '上游未提供固定到期日'
+  if (credential.refreshTokenValidity === 'error') return '最近兑换异常，未返回精确到期时间'
+  return mailbox.provider === 'microsoft' ? '微软未返回精确到期时间' : '上游未返回精确到期时间'
 }
 
 export function MailboxDetailDrawer({ mailbox, onClose }: MailboxDetailDrawerProps) {

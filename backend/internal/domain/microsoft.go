@@ -12,6 +12,7 @@ const MicrosoftCredentialSecretVersion = 1
 type MicrosoftCredentialSecret struct {
 	SchemaVersion int    `json:"schema_version"`
 	ClientID      string `json:"client_id"`
+	Password      string `json:"password,omitempty"`
 	RefreshToken  string `json:"refresh_token,omitempty"`
 	// Deprecated compatibility fields are read from older encrypted payloads.
 	// New writes keep the shared Microsoft RT in RefreshToken only.

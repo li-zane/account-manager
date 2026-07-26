@@ -77,8 +77,14 @@ func NewRouter(deps Dependencies) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/mailboxes/{mailboxID}/messages", h.retrieveMailboxMessages)
 	mux.HandleFunc("GET /api/v1/mailbox-aliases/{aliasID}/messages", h.retrieveAliasMessages)
 	if deps.MessageCache != nil {
+		mux.HandleFunc("GET /api/v1/message-cache", h.manageCachedMessages)
+		mux.HandleFunc("GET /api/v1/message-cache/export", h.exportCachedMessages)
+		mux.HandleFunc("DELETE /api/v1/message-cache", h.deleteManagedCachedMessages)
 		mux.HandleFunc("GET /api/v1/mailboxes/{mailboxID}/cached-messages", h.listMailboxCachedMessages)
+		mux.HandleFunc("POST /api/v1/mailboxes/{mailboxID}/cached-messages/{messageID}/viewed", h.markMailboxCachedMessageViewed)
 		mux.HandleFunc("POST /api/v1/mailboxes/{mailboxID}/messages/sync", h.syncMailboxMessages)
+		mux.HandleFunc("DELETE /api/v1/mailboxes/{mailboxID}/cached-messages", h.purgeMailboxCachedMessages)
+		mux.HandleFunc("POST /api/v1/mailboxes/{mailboxID}/cached-messages/range", h.restoreMailboxCachedMessageRange)
 		mux.HandleFunc("GET /api/v1/mailbox-aliases/{aliasID}/cached-messages", h.listAliasCachedMessages)
 		mux.HandleFunc("POST /api/v1/mailbox-aliases/{aliasID}/messages/sync", h.syncAliasMessages)
 	}
@@ -918,13 +924,21 @@ func overviewCredentialAuth(provider string, summaries []service.CredentialSumma
 	result := overviewProviderAuth(provider, false)
 	seenModes := make(map[string]struct{})
 	for _, summary := range summaries {
+		verifiedMethods := make(map[domain.RetrievalMethod]bool, len(summary.RetrievalCapabilities))
+		for _, capability := range summary.RetrievalCapabilities {
+			verifiedMethods[capability.Method] = capability.Status == "verified"
+		}
 		for _, method := range summary.RetrievalMethods {
 			mode := ""
 			switch method {
-			case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
-				mode = "graph"
+			case domain.RetrievalMicrosoftGraph:
+				if verifiedMethods[method] {
+					mode = "graph"
+				}
 			case domain.RetrievalIMAPOAuth, domain.RetrievalIMAPPassword:
-				mode = "imap"
+				if provider != "microsoft" || verifiedMethods[method] {
+					mode = "imap"
+				}
 			case domain.RetrievalGmailAPI:
 				mode = "oauth"
 			}
@@ -1002,6 +1016,17 @@ func parseMessageQuery(r *http.Request) (domain.MessageQuery, error) {
 		}
 		parsed = parsed.UTC()
 		query.After = &parsed
+	}
+	if raw := strings.TrimSpace(values.Get("before")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return domain.MessageQuery{}, fmt.Errorf("%w: before must be RFC3339", domain.ErrInvalid)
+		}
+		parsed = parsed.UTC()
+		query.Before = &parsed
+	}
+	if query.After != nil && query.Before != nil && !query.After.Before(*query.Before) {
+		return domain.MessageQuery{}, fmt.Errorf("%w: after must be earlier than before", domain.ErrInvalid)
 	}
 	var err error
 	if query.Limit, err = parseNonNegativeQueryInt(values.Get("limit"), "limit"); err != nil {

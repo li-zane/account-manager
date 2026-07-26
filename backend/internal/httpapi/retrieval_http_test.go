@@ -55,7 +55,7 @@ func (r *retrievalHTTPRetriever) Retrieve(_ context.Context, mailbox domain.Mail
 	r.calls = append(r.calls, retrievalHTTPCall{MailboxID: mailbox.ID, Query: query})
 	r.mu.Unlock()
 	return []domain.Message{
-		{ID: "matching", InternetMessageID: "<matching@example.test>", RecipientAddresses: []string{query.RecipientAddress}, ReceivedAt: r.receivedAt},
+		{ID: "matching", InternetMessageID: "<matching@example.test>", RecipientAddresses: []string{query.RecipientAddress}, ReceivedAt: r.receivedAt, Unread: true},
 		{ID: "other", InternetMessageID: "<other@example.test>", RecipientAddresses: []string{"other@example.net"}, ReceivedAt: r.receivedAt},
 	}, nil
 }
@@ -95,8 +95,10 @@ func TestAdminMessageRetrievalAuthAndQueryMapping(t *testing.T) {
 	}
 
 	after := fixture.now.Add(-time.Hour)
+	before := fixture.now.Add(time.Hour)
 	parameters := url.Values{
 		"after":     {after.Format(time.RFC3339)},
+		"before":    {before.Format(time.RFC3339)},
 		"limit":     {"7"},
 		"unread":    {"true"},
 		"folder":    {"junk"},
@@ -114,7 +116,7 @@ func TestAdminMessageRetrievalAuthAndQueryMapping(t *testing.T) {
 		t.Fatalf("retrieval calls = %+v", calls)
 	}
 	query := calls[0].Query
-	if calls[0].MailboxID != fixture.mailbox1.ID || query.After == nil || !query.After.Equal(after) || query.Limit != 7 || !query.Unread || query.Folder != domain.MessageFolderJunk || query.RetrievalMethod != domain.RetrievalIMAPPassword || query.PageSize != 11 || query.MaxPages != 4 || query.RecipientAddress != fixture.mailbox1.NormalizedAddress {
+	if calls[0].MailboxID != fixture.mailbox1.ID || query.After == nil || !query.After.Equal(after) || query.Before == nil || !query.Before.Equal(before) || query.Limit != 7 || !query.Unread || query.Folder != domain.MessageFolderJunk || query.RetrievalMethod != domain.RetrievalIMAPPassword || query.PageSize != 11 || query.MaxPages != 4 || query.RecipientAddress != fixture.mailbox1.NormalizedAddress {
 		t.Fatalf("mapped query = %+v", calls[0])
 	}
 
@@ -216,6 +218,16 @@ func TestCachedMessageHTTPRoutesSyncMethodAndPreserveAliasIsolation(t *testing.T
 	if body["count"] != float64(1) || body["new_count"] != float64(1) {
 		t.Fatalf("synchronized alias cache = %+v", body)
 	}
+	messages := body["messages"].([]any)
+	messageID := messages[0].(map[string]any)["id"].(string)
+	viewedPath := "/api/v1/mailboxes/" + fixture.mailbox1.ID + "/cached-messages/" + messageID + "/viewed"
+	response = retrievalRequest(fixture.router, http.MethodPost, viewedPath, "")
+	decodeRetrievalResponse(t, response, http.StatusUnauthorized)
+	response = retrievalRequest(fixture.router, http.MethodPost, viewedPath, retrievalHTTPAdminToken)
+	viewed := decodeRetrievalResponse(t, response, http.StatusOK)
+	if viewed["viewed"] != true {
+		t.Fatalf("mark viewed response = %+v", viewed)
+	}
 	calls := fixture.retriever.snapshot()
 	if len(calls) != 1 || calls[0].Query.Folder != domain.MessageFolderJunk || calls[0].Query.RetrievalMethod != domain.RetrievalIMAPPassword || calls[0].Query.RecipientAddress != fixture.alias1.NormalizedAddress {
 		t.Fatalf("cache sync query = %+v", calls)
@@ -225,6 +237,10 @@ func TestCachedMessageHTTPRoutesSyncMethodAndPreserveAliasIsolation(t *testing.T
 	body = decodeRetrievalResponse(t, response, http.StatusOK)
 	if body["count"] != float64(1) {
 		t.Fatalf("cached alias messages = %+v", body)
+	}
+	messages = body["messages"].([]any)
+	if messages[0].(map[string]any)["viewed_at"] == nil {
+		t.Fatalf("viewed state was not returned by cache route: %+v", messages[0])
 	}
 	response = retrievalRequest(fixture.router, http.MethodGet, "/api/v1/mailbox-aliases/"+fixture.alias2.ID+"/cached-messages?folder=Junk", retrievalHTTPAdminToken)
 	body = decodeRetrievalResponse(t, response, http.StatusOK)

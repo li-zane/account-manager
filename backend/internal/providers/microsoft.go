@@ -3,6 +3,7 @@ package providers
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,8 @@ import (
 const (
 	defaultMicrosoftTokenEndpoint = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 	defaultMicrosoftGraphBaseURL  = "https://graph.microsoft.com/v1.0"
-	defaultMicrosoftRESTBaseURL   = "https://outlook.office.com/api/v2.0"
+	defaultMicrosoftGraphScope    = "https://graph.microsoft.com/Mail.Read offline_access"
+	defaultMicrosoftGraphFallback = "https://graph.microsoft.com/.default"
 	defaultMicrosoftIMAPScope     = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 	defaultMicrosoftPageSize      = 50
 	defaultMicrosoftMaxPages      = 10
@@ -32,11 +34,10 @@ const (
 )
 
 type MicrosoftConfig struct {
-	TokenEndpoint      string
-	GraphBaseURL       string
-	OutlookRESTBaseURL string
-	RefreshLead        time.Duration
-	Now                func() time.Time
+	TokenEndpoint string
+	GraphBaseURL  string
+	RefreshLead   time.Duration
+	Now           func() time.Time
 }
 
 // MicrosoftAdapter owns Microsoft token and Graph payloads. Credential
@@ -49,7 +50,6 @@ type MicrosoftAdapter struct {
 	httpClient    *http.Client
 	tokenEndpoint string
 	graphBaseURL  string
-	restBaseURL   string
 	refreshLead   time.Duration
 	now           func() time.Time
 	imapFetch     microsoftIMAPFetchFunc
@@ -67,10 +67,6 @@ func NewMicrosoftAdapter(config MicrosoftConfig, secrets ports.SecretBroker, cli
 	if graphBaseURL == "" {
 		graphBaseURL = defaultMicrosoftGraphBaseURL
 	}
-	restBaseURL := strings.TrimRight(strings.TrimSpace(config.OutlookRESTBaseURL), "/")
-	if restBaseURL == "" {
-		restBaseURL = defaultMicrosoftRESTBaseURL
-	}
 	refreshLead := config.RefreshLead
 	if refreshLead <= 0 {
 		refreshLead = 5 * time.Minute
@@ -85,7 +81,6 @@ func NewMicrosoftAdapter(config MicrosoftConfig, secrets ports.SecretBroker, cli
 		httpClient:    client,
 		tokenEndpoint: tokenEndpoint,
 		graphBaseURL:  graphBaseURL,
-		restBaseURL:   restBaseURL,
 		refreshLead:   refreshLead,
 		now:           now,
 	}
@@ -100,7 +95,7 @@ func (a MicrosoftAdapter) Descriptor(context.Context) domain.ProviderDescriptor 
 			ProvisionMailbox: false,
 			ManageAliases:    false,
 			RefreshTokens:    true,
-			RetrievalMethods: []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth, domain.RetrievalDualToken},
+			RetrievalMethods: []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth, domain.RetrievalDualToken},
 		},
 	}
 }
@@ -114,7 +109,7 @@ func (a MicrosoftAdapter) Provision(context.Context, domain.ProvisionMailboxRequ
 }
 
 func (a MicrosoftAdapter) RetrievalMethods() []domain.RetrievalMethod {
-	return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth, domain.RetrievalDualToken}
+	return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth, domain.RetrievalDualToken}
 }
 
 func (a MicrosoftAdapter) Retrieve(ctx context.Context, mailbox domain.Mailbox, credential domain.MailboxCredential, query domain.MessageQuery) ([]domain.Message, error) {
@@ -138,20 +133,7 @@ func (a MicrosoftAdapter) Retrieve(ctx context.Context, mailbox domain.Mailbox, 
 		if err := a.validateAccessToken(token, expiresAt, credential.ExpiresAt, "Microsoft Graph"); err != nil {
 			return nil, err
 		}
-		if microsoftScopePrefersOutlookREST(secret.GraphScope) {
-			return a.retrieveOutlookREST(ctx, token, query)
-		}
-		messages, graphErr := a.retrieveGraph(ctx, token, query)
-		if graphErr != nil && shouldFallbackFromMicrosoftGraph(graphErr) {
-			return a.retrieveOutlookREST(ctx, token, query)
-		}
-		return messages, graphErr
-	case domain.RetrievalOutlookREST:
-		token, expiresAt := graphAccessToken(secret)
-		if err := a.validateAccessToken(token, expiresAt, credential.ExpiresAt, "Outlook REST"); err != nil {
-			return nil, err
-		}
-		return a.retrieveOutlookREST(ctx, token, query)
+		return a.retrieveGraph(ctx, token, query)
 	case domain.RetrievalIMAPOAuth:
 		token, expiresAt := imapAccessToken(secret)
 		if err := a.validateAccessToken(token, expiresAt, credential.ExpiresAt, "Microsoft IMAP"); err != nil {
@@ -184,6 +166,82 @@ func (a MicrosoftAdapter) Retrieve(ctx context.Context, mailbox domain.Mailbox, 
 	}
 }
 
+func (a MicrosoftAdapter) EnsureAccessToken(ctx context.Context, mailbox domain.Mailbox, credential domain.MailboxCredential, method domain.RetrievalMethod, force bool) (domain.RefreshedCredential, bool, error) {
+	if !a.configured() {
+		return domain.RefreshedCredential{}, false, notConfigured(domain.ProviderMicrosoft, "refresh")
+	}
+	if _, err := microsoftRetrievalMethod(credential.Kind, method); err != nil {
+		return domain.RefreshedCredential{}, false, err
+	}
+	secret, err := a.openCredential(ctx, credential)
+	if err != nil {
+		return domain.RefreshedCredential{}, false, err
+	}
+	var token string
+	var expiresAt *time.Time
+	switch method {
+	case domain.RetrievalMicrosoftGraph:
+		token, expiresAt = graphAccessToken(secret)
+	case domain.RetrievalIMAPOAuth:
+		token, expiresAt = imapAccessToken(secret)
+	default:
+		return domain.RefreshedCredential{}, false, fmt.Errorf("%w: unsupported Microsoft retrieval method %q", domain.ErrInvalid, method)
+	}
+	if !force && strings.TrimSpace(token) != "" && (expiresAt == nil || expiresAt.After(a.clock()().UTC().Add(a.refreshLead))) {
+		return domain.RefreshedCredential{}, false, nil
+	}
+	clientID := firstNonEmpty(secret.ClientID, credential.ClientID)
+	refreshToken := firstNonEmpty(secret.RefreshToken, secret.IMAPRefreshToken, secret.GraphRefreshToken)
+	if strings.TrimSpace(clientID) == "" {
+		return domain.RefreshedCredential{}, false, fmt.Errorf("%w: Microsoft OAuth client ID is required", domain.ErrInvalid)
+	}
+	var result microsoftTokenResult
+	if method == domain.RetrievalMicrosoftGraph {
+		result, err = a.refreshGraphAccessToken(ctx, clientID, refreshToken, secret.GraphScope)
+		if err == nil {
+			applyGraphToken(&secret, result)
+		}
+	} else {
+		result, err = a.refreshAccessToken(ctx, clientID, refreshToken, microsoftIMAPScope(secret.IMAPScope))
+		if err == nil {
+			applyIMAPToken(&secret, result)
+		}
+	}
+	if err != nil {
+		return domain.RefreshedCredential{}, false, err
+	}
+	secret.ClientID = clientID
+	secret.SchemaVersion = domain.MicrosoftCredentialSecretVersion
+	setSharedMicrosoftRefreshToken(&secret, firstNonEmpty(result.RefreshToken, refreshToken))
+	refreshed, err := a.sealRefreshedCredential(ctx, secret, result.ExpiresAt)
+	return refreshed, err == nil, err
+}
+
+func (a MicrosoftAdapter) SyncIncremental(ctx context.Context, mailbox domain.Mailbox, credential domain.MailboxCredential, request domain.MessageSyncRequest) (domain.MessageSyncResult, error) {
+	secret, err := a.openCredential(ctx, credential)
+	if err != nil {
+		return domain.MessageSyncResult{}, err
+	}
+	switch request.Method {
+	case domain.RetrievalMicrosoftGraph:
+		token, expiresAt := graphAccessToken(secret)
+		if err := a.validateAccessToken(token, expiresAt, credential.ExpiresAt, "Microsoft Graph"); err != nil {
+			return domain.MessageSyncResult{}, err
+		}
+		return a.syncGraphDelta(ctx, token, request)
+	case domain.RetrievalIMAPOAuth:
+		token, expiresAt := imapAccessToken(secret)
+		if err := a.validateAccessToken(token, expiresAt, credential.ExpiresAt, "Microsoft IMAP"); err != nil {
+			return domain.MessageSyncResult{}, err
+		}
+		secret.IMAPAccessToken = token
+		secret.IMAPUsername = firstNonEmpty(secret.IMAPUsername, mailbox.NormalizedAddress, mailbox.Address)
+		return syncMicrosoftIMAP(ctx, secret, request)
+	default:
+		return domain.MessageSyncResult{}, fmt.Errorf("%w: unsupported Microsoft incremental method %q", domain.ErrInvalid, request.Method)
+	}
+}
+
 func (a MicrosoftAdapter) Refresh(ctx context.Context, mailbox domain.Mailbox, credential domain.MailboxCredential) (domain.RefreshedCredential, error) {
 	if !a.configured() {
 		return domain.RefreshedCredential{}, notConfigured(domain.ProviderMicrosoft, "refresh")
@@ -209,7 +267,7 @@ func (a MicrosoftAdapter) Refresh(ctx context.Context, mailbox domain.Mailbox, c
 	switch credential.Kind {
 	case domain.CredentialMicrosoftGraphOAuth:
 		source := firstNonEmpty(secret.RefreshToken, secret.GraphRefreshToken)
-		result, refreshErr := a.refreshAccessToken(ctx, clientID, source, secret.GraphScope)
+		result, refreshErr := a.refreshGraphAccessToken(ctx, clientID, source, secret.GraphScope)
 		if refreshErr != nil {
 			return domain.RefreshedCredential{}, refreshErr
 		}
@@ -239,7 +297,7 @@ func (a MicrosoftAdapter) refreshSharedDualCredential(ctx context.Context, crede
 	// fields may differ after an older dual refresh, where IMAP was the second
 	// request, so prefer it when the canonical field is absent.
 	canonical := firstNonEmpty(secret.RefreshToken, secret.IMAPRefreshToken, secret.GraphRefreshToken)
-	graphResult, refreshErr := a.refreshAccessToken(ctx, clientID, canonical, secret.GraphScope)
+	graphResult, refreshErr := a.refreshGraphAccessToken(ctx, clientID, canonical, secret.GraphScope)
 	if refreshErr != nil {
 		return domain.RefreshedCredential{}, fmt.Errorf("Microsoft Graph token refresh: %w", refreshErr)
 	}
@@ -395,7 +453,7 @@ func (a MicrosoftAdapter) refreshAccessToken(ctx context.Context, clientID, refr
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(body, &upstream)
-		return microsoftTokenResult{}, fmt.Errorf("Microsoft token request failed (status %d, code %s)", response.StatusCode, safeUpstreamCode(upstream.Error))
+		return microsoftTokenResult{}, microsoftOAuthError{StatusCode: response.StatusCode, Code: safeUpstreamCode(upstream.Error)}
 	}
 	var payload struct {
 		AccessToken  string          `json:"access_token"`
@@ -426,6 +484,31 @@ func (a MicrosoftAdapter) refreshAccessToken(ctx context.Context, clientID, refr
 		Scope:        payload.Scope,
 		ExpiresAt:    expiresAt,
 	}, nil
+}
+
+func (a MicrosoftAdapter) refreshGraphAccessToken(ctx context.Context, clientID, refreshToken, scope string) (microsoftTokenResult, error) {
+	requestedScope := microsoftGraphScope(scope)
+	result, err := a.refreshAccessToken(ctx, clientID, refreshToken, requestedScope)
+	if err == nil || requestedScope != defaultMicrosoftGraphScope || !errors.Is(err, domain.ErrUnauthorized) {
+		return result, err
+	}
+	return a.refreshAccessToken(ctx, clientID, refreshToken, defaultMicrosoftGraphFallback)
+}
+
+type microsoftOAuthError struct {
+	StatusCode int
+	Code       string
+}
+
+func (e microsoftOAuthError) Error() string {
+	return fmt.Sprintf("Microsoft token request failed (status %d, code %s)", e.StatusCode, safeUpstreamCode(e.Code))
+}
+
+func (e microsoftOAuthError) Unwrap() error {
+	if e.Code == "invalid_grant" || e.Code == "invalid_client" || e.StatusCode == http.StatusUnauthorized {
+		return domain.ErrUnauthorized
+	}
+	return nil
 }
 
 func (a MicrosoftAdapter) retrieveGraph(ctx context.Context, accessToken string, query domain.MessageQuery) ([]domain.Message, error) {
@@ -484,6 +567,9 @@ func (a MicrosoftAdapter) retrieveGraph(ctx context.Context, accessToken string,
 	if query.After != nil {
 		filters = append(filters, "receivedDateTime ge "+query.After.UTC().Format(time.RFC3339))
 	}
+	if query.Before != nil {
+		filters = append(filters, "receivedDateTime lt "+query.Before.UTC().Format(time.RFC3339))
+	}
 	if query.Unread {
 		filters = append(filters, "isRead eq false")
 	}
@@ -504,6 +590,10 @@ func (a MicrosoftAdapter) retrieveGraph(ctx context.Context, accessToken string,
 			return nil, pageErr
 		}
 		for _, item := range page.Value {
+			item, pageErr = a.hydrateGraphInlineImages(ctx, accessToken, item)
+			if pageErr != nil {
+				return nil, pageErr
+			}
 			message, normalizeErr := normalizeGraphMessage(item)
 			if normalizeErr != nil {
 				return nil, normalizeErr
@@ -534,130 +624,9 @@ func (a MicrosoftAdapter) retrieveGraph(ctx context.Context, accessToken string,
 	return result, nil
 }
 
-func (a MicrosoftAdapter) retrieveOutlookREST(ctx context.Context, accessToken string, query domain.MessageQuery) ([]domain.Message, error) {
-	limit, pageSize, maxPages, err := normalizeMicrosoftAPIQuery(query)
-	if err != nil {
-		return nil, err
-	}
-	folder, err := microsoftFolderName(query.Folder)
-	if err != nil {
-		return nil, err
-	}
-	requestedRecipient := ""
-	if strings.TrimSpace(query.RecipientAddress) != "" {
-		requestedRecipient, err = normalizeAddress(query.RecipientAddress)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid recipient filter", domain.ErrInvalid)
-		}
-	}
-
-	base, err := url.Parse(a.outlookRESTURL())
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return nil, fmt.Errorf("%w: invalid Outlook REST base URL", domain.ErrInvalid)
-	}
-	initial, err := url.Parse(strings.TrimRight(base.String(), "/") + "/me/mailfolders/" + url.PathEscape(folder) + "/messages")
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid Outlook REST messages URL", domain.ErrInvalid)
-	}
-	params := initial.Query()
-	params.Set("$top", strconv.Itoa(pageSize))
-	params.Set("$orderby", "ReceivedDateTime DESC")
-	params.Set("$select", strings.Join(outlookRESTSelectFields, ","))
-	filters := make([]string, 0, 2)
-	if query.After != nil {
-		filters = append(filters, "ReceivedDateTime ge "+query.After.UTC().Format(time.RFC3339))
-	}
-	if query.Unread {
-		filters = append(filters, "IsRead eq false")
-	}
-	if len(filters) > 0 {
-		params.Set("$filter", strings.Join(filters, " and "))
-	}
-	initial.RawQuery = params.Encode()
-
-	next := initial
-	result := make([]domain.Message, 0, min(limit, pageSize))
-	seen := make(map[string]struct{})
-	for pageNumber := 0; pageNumber < maxPages && next != nil && len(result) < limit; pageNumber++ {
-		if !sameOrigin(base, next) {
-			return nil, fmt.Errorf("%w: Outlook REST pagination changed origin", domain.ErrInvalid)
-		}
-		page, pageErr := a.fetchOutlookRESTPage(ctx, accessToken, next)
-		if pageErr != nil {
-			return nil, pageErr
-		}
-		for _, item := range page.Value {
-			message, normalizeErr := normalizeGraphMessage(item)
-			if normalizeErr != nil {
-				return nil, normalizeErr
-			}
-			if requestedRecipient != "" && !MessageMatchesRecipient(message, requestedRecipient) {
-				continue
-			}
-			fingerprint := firstNonEmpty(message.ID, message.InternetMessageID)
-			if fingerprint != "" {
-				if _, exists := seen[fingerprint]; exists {
-					continue
-				}
-				seen[fingerprint] = struct{}{}
-			}
-			result = append(result, message)
-			if len(result) == limit {
-				break
-			}
-		}
-		next, err = resolveMicrosoftNextLink(base, next, page.NextLink, "Outlook REST")
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-var outlookRESTSelectFields = []string{
-	"Id", "InternetMessageId", "Subject", "ReceivedDateTime", "BodyPreview", "Body",
-	"From", "Sender", "ToRecipients", "CcRecipients", "InternetMessageHeaders", "IsRead",
-}
-
-func normalizeMicrosoftAPIQuery(query domain.MessageQuery) (limit, pageSize, maxPages int, err error) {
-	limit = query.Limit
-	if limit <= 0 {
-		limit = defaultMicrosoftPageSize
-	}
-	if limit > maxMicrosoftMessageLimit {
-		limit = maxMicrosoftMessageLimit
-	}
-	pageSize = query.PageSize
-	if pageSize <= 0 {
-		pageSize = min(limit, defaultMicrosoftPageSize)
-	}
-	if pageSize > maxMicrosoftPageSize {
-		pageSize = maxMicrosoftPageSize
-	}
-	maxPages = query.MaxPages
-	if maxPages <= 0 {
-		maxPages = defaultMicrosoftMaxPages
-	}
-	if maxPages > maxMicrosoftPages {
-		maxPages = maxMicrosoftPages
-	}
-	return limit, pageSize, maxPages, nil
-}
-
-func microsoftFolderName(folder domain.MessageFolder) (string, error) {
-	switch folder {
-	case "", domain.MessageFolderInbox:
-		return "inbox", nil
-	case domain.MessageFolderJunk:
-		return "junkemail", nil
-	default:
-		return "", fmt.Errorf("%w: unsupported Microsoft mail folder %q", domain.ErrInvalid, folder)
-	}
-}
-
 var graphSelectFields = []string{
 	"id", "internetMessageId", "subject", "receivedDateTime", "bodyPreview", "body",
-	"from", "sender", "toRecipients", "ccRecipients", "internetMessageHeaders", "isRead",
+	"from", "sender", "toRecipients", "ccRecipients", "internetMessageHeaders", "isRead", "hasAttachments",
 }
 
 type graphEmailAddress struct {
@@ -687,6 +656,59 @@ type graphMessage struct {
 	CcRecipients           []graphRecipient `json:"ccRecipients"`
 	InternetMessageHeaders []graphHeader    `json:"internetMessageHeaders"`
 	IsRead                 *bool            `json:"isRead"`
+	HasAttachments         bool             `json:"hasAttachments"`
+	Removed                json.RawMessage  `json:"@removed"`
+}
+
+type graphAttachment struct {
+	ContentType  string `json:"contentType"`
+	ContentID    string `json:"contentId"`
+	ContentBytes []byte `json:"contentBytes"`
+	IsInline     bool   `json:"isInline"`
+}
+
+func (a MicrosoftAdapter) hydrateGraphInlineImages(ctx context.Context, accessToken string, item graphMessage) (graphMessage, error) {
+	if !item.HasAttachments || !strings.EqualFold(item.Body.ContentType, "html") || !strings.Contains(strings.ToLower(item.Body.Content), "cid:") {
+		return item, nil
+	}
+	target, err := url.Parse(a.graphURL() + "/me/messages/" + url.PathEscape(item.ID) + "/attachments?$top=50")
+	if err != nil {
+		return graphMessage{}, fmt.Errorf("%w: invalid Microsoft Graph attachments URL", domain.ErrInvalid)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return graphMessage{}, fmt.Errorf("create Microsoft Graph attachments request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err := a.client().Do(req)
+	if err != nil {
+		return graphMessage{}, fmt.Errorf("Microsoft Graph attachments request failed: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := readLimitedBody(response.Body)
+	if err != nil {
+		return graphMessage{}, err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return graphMessage{}, microsoftAPIError{Service: "Microsoft Graph", StatusCode: response.StatusCode, Code: "attachments"}
+	}
+	var payload struct {
+		Value []graphAttachment `json:"value"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return graphMessage{}, fmt.Errorf("%w: malformed Microsoft Graph attachments response", domain.ErrInvalid)
+	}
+	images := make(map[string]string)
+	for _, attachment := range payload.Value {
+		contentID := strings.Trim(strings.TrimSpace(attachment.ContentID), "<>")
+		if !attachment.IsInline || contentID == "" || !strings.HasPrefix(strings.ToLower(attachment.ContentType), "image/") || len(attachment.ContentBytes) == 0 {
+			continue
+		}
+		images[contentID] = "data:" + attachment.ContentType + ";base64," + base64.StdEncoding.EncodeToString(attachment.ContentBytes)
+	}
+	item.Body.Content = replaceCIDImages(item.Body.Content, images)
+	return item, nil
 }
 
 type graphBody struct {
@@ -695,49 +717,39 @@ type graphBody struct {
 }
 
 type graphPage struct {
-	Value    []graphMessage `json:"value"`
-	NextLink string         `json:"@odata.nextLink"`
-}
-
-func (a MicrosoftAdapter) fetchOutlookRESTPage(ctx context.Context, accessToken string, target *url.URL) (graphPage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return graphPage{}, fmt.Errorf("create Outlook REST request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	response, err := a.client().Do(req)
-	if err != nil {
-		return graphPage{}, fmt.Errorf("Outlook REST request failed: %w", err)
-	}
-	defer response.Body.Close()
-	body, err := readLimitedBody(response.Body)
-	if err != nil {
-		return graphPage{}, fmt.Errorf("read Outlook REST response: %w", err)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		var upstream struct {
-			Error struct {
-				Code string `json:"code"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(body, &upstream)
-		return graphPage{}, microsoftAPIError{Service: "Outlook REST", StatusCode: response.StatusCode, Code: safeUpstreamCode(upstream.Error.Code)}
-	}
-	var page graphPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		return graphPage{}, fmt.Errorf("%w: malformed Outlook REST response", domain.ErrInvalid)
-	}
-	return page, nil
+	Value     []graphMessage `json:"value"`
+	NextLink  string         `json:"@odata.nextLink"`
+	DeltaLink string         `json:"@odata.deltaLink"`
 }
 
 func (a MicrosoftAdapter) fetchGraphPage(ctx context.Context, accessToken string, target *url.URL) (graphPage, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		page, err := a.fetchGraphPageOnce(ctx, accessToken, target)
+		if err == nil {
+			return page, nil
+		}
+		lastErr = err
+		if attempt > 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF)) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return graphPage{}, ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	return graphPage{}, lastErr
+}
+
+func (a MicrosoftAdapter) fetchGraphPageOnce(ctx context.Context, accessToken string, target *url.URL) (graphPage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return graphPage{}, fmt.Errorf("create Microsoft Graph request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Prefer", `IdType="ImmutableId"`)
 	response, err := a.client().Do(req)
 	if err != nil {
 		return graphPage{}, fmt.Errorf("Microsoft Graph request failed: %w", err)
@@ -851,21 +863,105 @@ func (e microsoftAPIError) Error() string {
 }
 
 func (e microsoftAPIError) Unwrap() error {
+	if e.StatusCode == http.StatusGone {
+		return domain.ErrSyncCursorInvalid
+	}
 	if e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden {
 		return domain.ErrUnauthorized
 	}
 	return nil
 }
 
-func shouldFallbackFromMicrosoftGraph(err error) bool {
-	var upstream microsoftAPIError
-	return errors.As(err, &upstream) && upstream.Service == "Microsoft Graph" &&
-		(upstream.StatusCode == http.StatusUnauthorized || upstream.StatusCode == http.StatusForbidden || upstream.StatusCode >= http.StatusInternalServerError)
+func (a MicrosoftAdapter) syncGraphDelta(ctx context.Context, accessToken string, request domain.MessageSyncRequest) (domain.MessageSyncResult, error) {
+	base, err := url.Parse(a.graphURL())
+	if err != nil {
+		return domain.MessageSyncResult{}, fmt.Errorf("%w: invalid Microsoft Graph base URL", domain.ErrInvalid)
+	}
+	var next *url.URL
+	if strings.TrimSpace(request.Cursor) != "" {
+		next, err = url.Parse(request.Cursor)
+		if err != nil || !next.IsAbs() || !sameOrigin(base, next) {
+			return domain.MessageSyncResult{}, fmt.Errorf("%w: invalid Microsoft Graph delta cursor", domain.ErrSyncCursorInvalid)
+		}
+	} else {
+		folder := "inbox"
+		if request.Folder == domain.MessageFolderJunk {
+			folder = "junkemail"
+		}
+		next = base.ResolveReference(&url.URL{Path: strings.TrimRight(base.Path, "/") + "/me/mailFolders/" + folder + "/messages/delta"})
+		query := next.Query()
+		query.Set("$select", strings.Join(graphSelectFields, ","))
+		query.Set("$top", strconv.Itoa(max(1, min(request.PageSize, maxMicrosoftPageSize))))
+		next.RawQuery = query.Encode()
+	}
+	maxPages := request.MaxPages
+	if maxPages <= 0 || maxPages > maxMicrosoftPages {
+		maxPages = defaultMicrosoftMaxPages
+	}
+	limit := request.Limit
+	if limit <= 0 || limit > maxMicrosoftMessageLimit {
+		limit = maxMicrosoftMessageLimit
+	}
+	result := domain.MessageSyncResult{Complete: true}
+	for pageNumber := 0; next != nil && pageNumber < maxPages; pageNumber++ {
+		page, fetchErr := a.fetchGraphPage(ctx, accessToken, next)
+		if fetchErr != nil {
+			return domain.MessageSyncResult{}, fetchErr
+		}
+		for _, item := range page.Value {
+			if len(item.Removed) > 0 && string(item.Removed) != "null" {
+				if id := strings.TrimSpace(item.ID); id != "" {
+					result.DeletedProviderMessageIDs = append(result.DeletedProviderMessageIDs, id)
+				}
+				continue
+			}
+			item, fetchErr = a.hydrateGraphInlineImages(ctx, accessToken, item)
+			if fetchErr != nil {
+				return domain.MessageSyncResult{}, fetchErr
+			}
+			message, normalizeErr := normalizeGraphMessage(item)
+			if normalizeErr != nil {
+				return domain.MessageSyncResult{}, normalizeErr
+			}
+			result.Messages = append(result.Messages, message)
+		}
+		if page.NextLink != "" {
+			resolved, resolveErr := resolveGraphNextLink(base, next, page.NextLink)
+			if resolveErr != nil {
+				return domain.MessageSyncResult{}, resolveErr
+			}
+			result.Cursor = resolved.String()
+			next = resolved
+		} else if page.DeltaLink != "" {
+			resolved, resolveErr := resolveGraphNextLink(base, next, page.DeltaLink)
+			if resolveErr != nil {
+				return domain.MessageSyncResult{}, resolveErr
+			}
+			result.Cursor = resolved.String()
+			next = nil
+		} else {
+			next = nil
+		}
+		if len(result.Messages) >= limit && page.NextLink != "" {
+			result.Complete = false
+			break
+		}
+	}
+	if next != nil {
+		result.Complete = false
+	}
+	return result, nil
 }
 
-func microsoftScopePrefersOutlookREST(scope string) bool {
+func microsoftGraphScope(scope string) string {
 	normalized := strings.ToLower(strings.TrimSpace(scope))
-	return strings.Contains(normalized, "outlook.office.com/") && !strings.Contains(normalized, "graph.microsoft.com/")
+	if normalized == "" || strings.Contains(normalized, "outlook.office.com/") {
+		return defaultMicrosoftGraphScope
+	}
+	if strings.Contains(normalized, "graph.microsoft.com/.default") {
+		return defaultMicrosoftGraphFallback
+	}
+	return strings.TrimSpace(scope)
 }
 
 func microsoftIMAPScope(scope string) string {
@@ -883,7 +979,7 @@ func graphAccessToken(secret domain.MicrosoftCredentialSecret) (string, *time.Ti
 	if strings.TrimSpace(secret.GraphAccessToken) != "" {
 		return secret.GraphAccessToken, secret.GraphTokenExpiresAt
 	}
-	if (secret.AccessTokenMethod == domain.RetrievalMicrosoftGraph || secret.AccessTokenMethod == domain.RetrievalOutlookREST) && strings.TrimSpace(secret.AccessToken) != "" {
+	if secret.AccessTokenMethod == domain.RetrievalMicrosoftGraph && strings.TrimSpace(secret.AccessToken) != "" {
 		return secret.AccessToken, secret.AccessTokenExpiresAt
 	}
 	return "", nil
@@ -936,13 +1032,6 @@ func (a MicrosoftAdapter) graphURL() string {
 		return defaultMicrosoftGraphBaseURL
 	}
 	return a.graphBaseURL
-}
-
-func (a MicrosoftAdapter) outlookRESTURL() string {
-	if strings.TrimSpace(a.restBaseURL) == "" {
-		return defaultMicrosoftRESTBaseURL
-	}
-	return a.restBaseURL
 }
 
 func (a MicrosoftAdapter) client() *http.Client {

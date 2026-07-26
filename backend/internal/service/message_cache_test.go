@@ -2,6 +2,10 @@ package service_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,11 +37,11 @@ func TestMessageCacheIncrementalDeduplicationAndAliasIsolationWithoutRefresh(t *
 	if err := store.CreateAlias(ctx, alias); err != nil {
 		t.Fatal(err)
 	}
-	expired := now.Add(-time.Hour)
-	createRetrievalCredential(t, store, mailbox.ID, domain.CredentialMicrosoftDualToken, "sealed-shared-rt", expired, now)
+	expiry := now.Add(time.Hour)
+	createRetrievalCredential(t, store, mailbox.ID, domain.CredentialMicrosoftDualToken, "sealed-shared-rt", expiry, now)
 
 	t1, t2, t3 := now.Add(-30*time.Minute), now.Add(-20*time.Minute), now.Add(-10*time.Minute)
-	aliasFirst := domain.Message{ID: "provider-1", InternetMessageID: "<one@example.test>", RecipientAddresses: []string{alias.NormalizedAddress}, Subject: "first", ReceivedAt: t1}
+	aliasFirst := domain.Message{ID: "provider-1", InternetMessageID: "<one@example.test>", RecipientAddresses: []string{alias.NormalizedAddress}, Subject: "first", ReceivedAt: t1, Unread: true}
 	aliasSecond := domain.Message{ID: "provider-2", InternetMessageID: "<two@example.test>", RecipientAddresses: []string{alias.NormalizedAddress}, Subject: "second", ReceivedAt: t2}
 	other := domain.Message{ID: "provider-3", InternetMessageID: "<other@example.test>", RecipientAddresses: []string{"other@outlook.com"}, Subject: "other", ReceivedAt: t2}
 	junk := domain.Message{ID: "provider-4", InternetMessageID: "<junk@example.test>", RecipientAddresses: []string{alias.NormalizedAddress}, Subject: "junk", ReceivedAt: t3}
@@ -87,12 +91,20 @@ func TestMessageCacheIncrementalDeduplicationAndAliasIsolationWithoutRefresh(t *
 	if first.NewCount != 1 || len(first.Messages) != 1 || first.Messages[0].Subject != "first" {
 		t.Fatalf("first alias sync = %+v", first)
 	}
+	if err := cache.MarkViewed(ctx, mailbox.ID, first.Messages[0].ID); err != nil {
+		t.Fatal(err)
+	}
 	second, err := cache.Sync(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.NewCount != 1 || len(second.Messages) != 2 || second.Messages[0].Subject != "second" {
 		t.Fatalf("second alias sync = %+v", second)
+	}
+	for _, message := range second.Messages {
+		if message.Subject == "first" && message.ViewedAt == nil {
+			t.Fatal("viewed state was lost during provider upsert")
+		}
 	}
 	if refreshCalls.Load() != 0 {
 		t.Fatalf("disabled token refresh called provider %d times", refreshCalls.Load())
@@ -121,11 +133,133 @@ func TestMessageCacheIncrementalDeduplicationAndAliasIsolationWithoutRefresh(t *
 	if _, err := cache.Sync(ctx, service.CachedMessagesInput{AliasID: alias.ID, Folder: domain.MessageFolderJunk, RetrievalMethod: domain.RetrievalIMAPOAuth}); err != nil {
 		t.Fatal(err)
 	}
-	lastMessageAt, err := cache.LastMessageAt(ctx, alias.ID)
+	lastMessageAt, err := cache.LastMessageAt(ctx, mailbox.ID)
 	if err != nil || lastMessageAt == nil || !lastMessageAt.Equal(t3) {
 		t.Fatalf("latest alias message = %v, err=%v", lastMessageAt, err)
 	}
 	if !providers.MessageMatchesRecipient(junk, alias.NormalizedAddress) {
 		t.Fatal("fixture junk message no longer matches the alias isolation rule")
+	}
+}
+
+func TestRestoreRangePersistsAutomaticFallbackMethod(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	store := memory.New()
+	mailbox := domain.Mailbox{
+		ID: "mbx_restore_fixture", Provider: domain.ProviderMicrosoft,
+		Address: "restore@outlook.com", NormalizedAddress: "restore@outlook.com",
+		Status: domain.MailboxStatusActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateMailbox(ctx, mailbox); err != nil {
+		t.Fatal(err)
+	}
+	createRetrievalCredential(t, store, mailbox.ID, domain.CredentialMicrosoftDualToken, "sealed-shared-rt", now.Add(time.Hour), now)
+
+	retriever := &retrievalTestRetriever{
+		methods: []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth},
+		retrieve: func(_ context.Context, _ domain.Mailbox, _ domain.MailboxCredential, query domain.MessageQuery) ([]domain.Message, error) {
+			if query.RetrievalMethod == domain.RetrievalMicrosoftGraph {
+				return nil, errors.New("graph temporarily unavailable")
+			}
+			return []domain.Message{{
+				ID: "imap:42", InternetMessageID: "<restore@example.test>", Subject: "restored",
+				RecipientAddresses: []string{mailbox.NormalizedAddress}, ReceivedAt: now.Add(-time.Hour),
+			}}, nil
+		},
+	}
+	retrieval := newRetrievalService(t, store, mailbox.Provider, retriever, now)
+	cache, err := service.NewMessageCacheService(store, store, retrieval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetClock(func() time.Time { return now })
+	after, before := now.Add(-2*time.Hour), now
+	count, err := cache.RestoreRange(ctx, service.ManageCachedMessagesInput{MailboxID: mailbox.ID, Folder: domain.MessageFolderInbox, After: &after, Before: &before})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("restored count = %d", count)
+	}
+	result, err := cache.QueryManaged(ctx, service.ManageCachedMessagesInput{MailboxID: mailbox.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].RetrievalMethod != domain.RetrievalIMAPOAuth {
+		t.Fatalf("restored messages = %+v", result.Messages)
+	}
+}
+
+func TestInitialMessageSyncWorkerBackfillsAllFallbackPages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	now := time.Date(2026, 7, 26, 11, 0, 0, 0, time.UTC)
+	store := memory.New()
+	mailbox := domain.Mailbox{
+		ID: "mbx_initial_sync_fixture", Provider: domain.ProviderMicrosoft,
+		Address: "initial@outlook.com", NormalizedAddress: "initial@outlook.com",
+		Status: domain.MailboxStatusActive, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateMailbox(ctx, mailbox); err != nil {
+		t.Fatal(err)
+	}
+	createRetrievalCredential(t, store, mailbox.ID, domain.CredentialMicrosoftDualToken, "sealed-shared-rt", now.Add(time.Hour), now)
+
+	retriever := &retrievalTestRetriever{
+		methods: []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph},
+		retrieve: func(_ context.Context, _ domain.Mailbox, _ domain.MailboxCredential, query domain.MessageQuery) ([]domain.Message, error) {
+			if query.Folder == domain.MessageFolderJunk {
+				return nil, nil
+			}
+			if query.Before != nil {
+				return []domain.Message{{
+					ID: "older-page", InternetMessageID: "<older-page@example.test>",
+					RecipientAddresses: []string{mailbox.NormalizedAddress}, ReceivedAt: now.Add(-500 * time.Minute),
+				}}, nil
+			}
+			messages := make([]domain.Message, 0, 500)
+			for index := range 500 {
+				messages = append(messages, domain.Message{
+					ID: fmt.Sprintf("page-one-%03d", index), InternetMessageID: fmt.Sprintf("<page-one-%03d@example.test>", index),
+					RecipientAddresses: []string{mailbox.NormalizedAddress}, ReceivedAt: now.Add(-time.Duration(index) * time.Minute),
+				})
+			}
+			return messages, nil
+		},
+	}
+	retrieval := newRetrievalService(t, store, mailbox.Provider, retriever, now)
+	cache, err := service.NewMessageCacheService(store, store, retrieval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetClock(func() time.Time { return now })
+	worker, err := service.NewInitialMessageSyncWorker(cache, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	if err := worker.ScheduleInitialSync(ctx, []string{mailbox.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		result, queryErr := cache.QueryManaged(ctx, service.ManageCachedMessagesInput{MailboxID: mailbox.ID, Limit: 1})
+		if queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if result.Count == 501 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("initial sync cached %d messages, want 501", result.Count)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

@@ -248,14 +248,25 @@ func TestTemplateJSONCaptureReportsInvalidValue(t *testing.T) {
 }
 
 func TestProviderFromAddressAppliesToBuiltinAndTemplateImports(t *testing.T) {
-	t.Run("simple builtin", func(t *testing.T) {
+	t.Run("custom delimited", func(t *testing.T) {
 		fixture := newTemplateTransferFixture(t)
+		format := domain.MailboxFormat{
+			ID: "format_test_provider_inference", Name: "Test provider inference", Kind: domain.MailboxFormatDelimited,
+			Direction: domain.MailboxFormatBoth, Delimiter: "----", Enabled: true,
+			Fields: []domain.MailboxFormatField{
+				{Column: "email", Target: "address", Required: true},
+				{Column: "platform_password", Target: "platform_account_password", Required: true, Sensitive: true},
+				{Column: "password", Target: "password", Required: true, Sensitive: true},
+			},
+			ParserConfig: json.RawMessage(`{"platform":"test-platform","provider_from_address":true}`),
+		}
+		createTemplateFormat(t, fixture.store, format)
 		data := strings.Join([]string{
 			"person@outlook.com----gpt-one----mail-one",
 			"person@googlemail.com----gpt-two----mail-two",
 		}, "\n")
 		preview, err := fixture.transfer.Preview(context.Background(), service.MailboxImportRequest{
-			FormatID: "fmt_builtin_simple3", Data: data, ConflictStrategy: domain.ConflictSkip,
+			FormatID: format.ID, Data: data, ConflictStrategy: domain.ConflictSkip,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -302,9 +313,21 @@ func TestProviderFromAddressAppliesToBuiltinAndTemplateImports(t *testing.T) {
 func TestCloudflareLegacyPickupKeyImportUsesOneWayPreparer(t *testing.T) {
 	ctx := context.Background()
 	fixture := newTemplateTransferFixture(t)
+	cloudflare := domain.ProviderCloudflareRoute
+	format := domain.MailboxFormat{
+		ID: "format_test_cloudflare_pickup", Name: "Test Cloudflare pickup", Kind: domain.MailboxFormatDelimited,
+		Direction: domain.MailboxFormatImport, Delimiter: "----", Provider: &cloudflare, Enabled: true,
+		Fields: []domain.MailboxFormatField{
+			{Column: "email", Target: "address", Required: true},
+			{Column: "platform_password", Target: "platform_account_password", Required: true, Sensitive: true},
+			{Column: "pickup_key", Target: "pickup_key", Required: true, Sensitive: true},
+		},
+		ParserConfig: json.RawMessage(`{"platform":"test-platform"}`),
+	}
+	createTemplateFormat(t, fixture.store, format)
 	rawPickupKey := "legacy-pickup-key-fixture"
 	preview, err := fixture.transfer.Preview(ctx, service.MailboxImportRequest{
-		FormatID: "fmt_builtin_cf_routed3",
+		FormatID: format.ID,
 		Data:     "route@rainynight.me----gpt-password----" + rawPickupKey,
 	})
 	if err != nil {
@@ -314,7 +337,7 @@ func TestCloudflareLegacyPickupKeyImportUsesOneWayPreparer(t *testing.T) {
 		t.Fatalf("Cloudflare pickup-key preview = %+v", preview)
 	}
 	result, err := fixture.transfer.Import(ctx, service.MailboxImportRequest{
-		FormatID: "fmt_builtin_cf_routed3",
+		FormatID: format.ID,
 		Data:     "route@rainynight.me----gpt-password----" + rawPickupKey,
 	})
 	if err != nil || result.Created != 1 {
@@ -334,7 +357,7 @@ func TestCloudflareLegacyPickupKeyImportUsesOneWayPreparer(t *testing.T) {
 
 	fixture.transfer.SetPickupKeyPreparer(nil)
 	_, err = fixture.transfer.Import(ctx, service.MailboxImportRequest{
-		FormatID: "fmt_builtin_cf_routed3",
+		FormatID: format.ID,
 		Data:     "other@rainynight.me----gpt-password----another-legacy-key",
 	})
 	if !errors.Is(err, domain.ErrNotConfigured) {

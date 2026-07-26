@@ -7,6 +7,7 @@ import {
   CloudCog,
   Database,
   Download,
+  HardDrive,
   KeyRound,
   LoaderCircle,
   Plus,
@@ -25,11 +26,11 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react
 import { ApiClientError, apiClient } from './api/client'
 import type { MailboxDashboard, MailboxImportResult, MailboxRecord, MailProvider, MessageProbeSettings, TokenRefreshSettings } from './api/types'
 import { AppShell, type ViewKey, type WorkspacePlatform } from './components/AppShell'
-import { BackupPanel } from './components/BackupPanel'
 import { BackupSettings } from './components/BackupSettings'
 import { MailboxTable } from './components/MailboxTable'
 import { MailboxDetailDrawer } from './components/MailboxDetailDrawer'
 import { MailboxInboxDialog } from './components/MailboxInboxDialog'
+import { MessageCacheSettings } from './components/MessageCacheSettings'
 import { MailboxTransferDialog, type TransferMode } from './components/MailboxTransferDialog'
 import { ProviderMark, providerMeta } from './components/ProviderMark'
 import { ProviderConnectionsSettings } from './components/ProviderConnectionsSettings'
@@ -108,8 +109,6 @@ function MailboxesView({
   onAdd,
   onImport,
   onExport,
-  onRunBackup,
-  backupRunning,
 }: {
   dashboard: MailboxDashboard | null
   source: 'api' | 'mock'
@@ -133,8 +132,8 @@ function MailboxesView({
   onAdd: () => void
   onImport: () => void
   onExport: () => void
-  onRunBackup: () => void
-  backupRunning: boolean
+  onRunBackup?: () => void
+  backupRunning?: boolean
 }) {
   const allMailboxes = dashboard?.mailboxes ?? []
   const filteredMailboxes = useMemo(() => {
@@ -225,7 +224,6 @@ function MailboxesView({
           {!loading && filteredMailboxes.length > 0 && <div className="list-footer"><span>显示 {filteredMailboxes.length} 个主邮箱{query ? `，匹配“${query}”` : ''}</span><span>已展开的分裂邮箱会跟随主邮箱导出</span></div>}
         </section>
 
-        {dashboard && <BackupPanel backup={dashboard.backup} running={backupRunning} onRun={onRunBackup} />}
       </div>
     </div>
   )
@@ -261,7 +259,7 @@ function WorkspaceView({ platform, onPlatformChange }: { platform: WorkspacePlat
   )
 }
 
-function SettingsView({ onServerChange }: { onServerChange: () => void }) {
+function SettingsView({ onServerChange, mailboxes }: { onServerChange: () => void; mailboxes: MailboxRecord[] }) {
   const [initialDraft] = useState(() => {
     const defaults = { compactTable: true, reduceMotion: false, retrievalMode: 'dual' }
     try {
@@ -285,7 +283,7 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
   const [compactTable, setCompactTable] = useState(initialDraft.compactTable)
   const [reduceMotion, setReduceMotion] = useState(initialDraft.reduceMotion)
   const [retrievalMode, setRetrievalMode] = useState(initialDraft.retrievalMode)
-  const [activeSection, setActiveSection] = useState<'mail' | 'connections' | 'backup' | 'interface'>('mail')
+  const [activeSection, setActiveSection] = useState<'mail' | 'cache' | 'connections' | 'backup' | 'interface'>('mail')
   const [draftSaved, setDraftSaved] = useState(true)
   useEffect(() => {
     document.documentElement.dataset.reduceMotion = String(reduceMotion)
@@ -395,13 +393,15 @@ function SettingsView({ onServerChange }: { onServerChange: () => void }) {
       <div className="settings-layout">
         <nav className="settings-nav" aria-label="设置分类">
           <button className={activeSection === 'mail' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('mail')}><KeyRound />邮箱取件<span>5</span></button>
+          <button className={activeSection === 'cache' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('cache')}><HardDrive />邮件缓存</button>
           <button className={activeSection === 'connections' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('connections')}><CloudCog />服务连接</button>
           <button className={activeSection === 'backup' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('backup')}><Database />数据备份</button>
           <button className={activeSection === 'interface' ? 'settings-nav__item settings-nav__item--active' : 'settings-nav__item'} type="button" onClick={() => setActiveSection('interface')}><SlidersHorizontal />界面与导航</button>
         </nav>
         <section className="settings-section">
-          {activeSection === 'mail' && <><div className="section-heading"><div><p className="eyebrow">MAIL ACCESS</p><h2>邮箱取件</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>自动维护 OAuth 令牌</strong><small>当前关闭时，手动与自动取件均不会刷新 RT</small></div><Toggle checked={autoRefresh} onChange={() => updateTokenRefresh(() => setAutoRefresh((value) => !value))} label="自动维护 OAuth 令牌" disabled={tokenRefreshLoading || tokenRefreshSaving} /></div><div className="setting-row"><div><strong>自动探测新邮件</strong><small>按间隔增量拉取收件箱与垃圾箱</small></div><Toggle checked={autoProbe} onChange={() => updateMessageProbe(() => setAutoProbe((value) => !value))} label="自动探测新邮件" disabled={tokenRefreshSaving} /></div><div className="setting-row"><div><strong>探测间隔</strong><small>后台缓存增量同步周期</small></div><label className="number-control"><input type="number" value={probeIntervalMinutes} min={1} max={1440} disabled={tokenRefreshSaving} onChange={(event) => updateMessageProbe(() => setProbeIntervalMinutes(Math.min(1440, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div><div className="setting-row"><div><strong>默认取件能力</strong><small>Microsoft 共享 RT 的首选通道</small></div><label className="select-control"><select value={retrievalMode} aria-label="默认取件能力" onChange={(event) => update(setRetrievalMode, event.target.value)}><option value="dual">Graph + REST + IMAP</option><option value="graph">Graph</option><option value="imap">IMAP</option></select><ChevronDown /></label></div><div className="setting-row"><div><strong>刷新提前时间</strong><small>仅用于短期访问令牌，不代表 RT 到期日</small></div><label className="number-control"><input type="number" value={refreshLeadMinutes} min={1} max={30} disabled={tokenRefreshLoading || tokenRefreshSaving} onChange={(event) => updateTokenRefresh(() => setRefreshLeadMinutes(Math.min(30, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div></div>{tokenRefreshError && <div className="settings-sync-error" role="alert">{tokenRefreshError}</div>}</>}
+          {activeSection === 'mail' && <><div className="section-heading"><div><p className="eyebrow">MAIL ACCESS</p><h2>邮箱取件</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>自动维护 OAuth 令牌</strong><small>当前关闭时，手动与自动取件均不会刷新 RT</small></div><Toggle checked={autoRefresh} onChange={() => updateTokenRefresh(() => setAutoRefresh((value) => !value))} label="自动维护 OAuth 令牌" disabled={tokenRefreshLoading || tokenRefreshSaving} /></div><div className="setting-row"><div><strong>自动探测新邮件</strong><small>按间隔增量拉取收件箱与垃圾箱</small></div><Toggle checked={autoProbe} onChange={() => updateMessageProbe(() => setAutoProbe((value) => !value))} label="自动探测新邮件" disabled={tokenRefreshSaving} /></div><div className="setting-row"><div><strong>探测间隔</strong><small>后台缓存增量同步周期</small></div><label className="number-control"><input type="number" value={probeIntervalMinutes} min={1} max={1440} disabled={tokenRefreshSaving} onChange={(event) => updateMessageProbe(() => setProbeIntervalMinutes(Math.min(1440, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div><div className="setting-row"><div><strong>默认取件能力</strong><small>Microsoft 共享 RT 的首选通道</small></div><label className="select-control"><select value={retrievalMode} aria-label="默认取件能力" onChange={(event) => update(setRetrievalMode, event.target.value)}><option value="dual">Graph + IMAP</option><option value="graph">Graph</option><option value="imap">IMAP</option></select><ChevronDown /></label></div><div className="setting-row"><div><strong>刷新提前时间</strong><small>仅用于短期访问令牌，不代表 RT 到期日</small></div><label className="number-control"><input type="number" value={refreshLeadMinutes} min={1} max={30} disabled={tokenRefreshLoading || tokenRefreshSaving} onChange={(event) => updateTokenRefresh(() => setRefreshLeadMinutes(Math.min(30, Math.max(1, Number(event.target.value) || 1))))} /><span>分钟</span></label></div></div>{tokenRefreshError && <div className="settings-sync-error" role="alert">{tokenRefreshError}</div>}</>}
           {activeSection === 'connections' && <ProviderConnectionsSettings />}
+          {activeSection === 'cache' && <MessageCacheSettings mailboxes={mailboxes} />}
           {activeSection === 'backup' && <BackupSettings onServerChange={onServerChange} />}
           {activeSection === 'interface' && <><div className="section-heading"><div><p className="eyebrow">NAVIGATION</p><h2>界面与导航</h2></div>{draftStatus}</div><div className="settings-group"><div className="setting-row"><div><strong>固定工作区</strong><small>显示在左侧导航中</small></div><button className="select-control" type="button">ChatGPT、Grok <ChevronDown /></button></div><div className="setting-row"><div><strong>紧凑表格</strong><small>在宽屏中显示更多邮箱字段</small></div><Toggle checked={compactTable} onChange={() => update(setCompactTable, (value) => !value)} label="紧凑表格" /></div><div className="setting-row"><div><strong>减少动效</strong><small>适用于需要降低动态效果的环境</small></div><Toggle checked={reduceMotion} onChange={() => update(setReduceMotion, (value) => !value)} label="减少动效" /></div></div></>}
         </section>
@@ -447,7 +447,6 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [backupRunning, setBackupRunning] = useState(false)
   const [addingMailbox, setAddingMailbox] = useState(false)
   const [detailMailbox, setDetailMailbox] = useState<MailboxRecord>()
   const [inboxMailbox, setInboxMailbox] = useState<MailboxRecord>()
@@ -457,6 +456,7 @@ export default function App() {
     return hash === 'workspace' || hash === 'settings' ? hash : 'mailboxes'
   })
   const [workspacePlatform, setWorkspacePlatform] = useState<WorkspacePlatform>('chatgpt')
+  const [backupRunning, setBackupRunning] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const [toast, setToast] = useState<string>()
 
@@ -648,7 +648,7 @@ export default function App() {
     <AppShell currentView={view} onViewChange={setView} onOpenWorkspace={openWorkspace} source={source}>
       {view === 'mailboxes' && <MailboxesView dashboard={dashboard} source={source} warning={warning} loading={loading} refreshing={refreshing} filter={filter} query={query} expandedIds={expandedIds} selectedIds={selectedIds} onFilterChange={setFilter} onQueryChange={setQuery} onToggleExpanded={handleToggleExpanded} onToggleSelected={handleToggleSelected} onToggleAll={handleToggleAll} onCopyAddress={handleCopyAddress} onOpenInbox={setInboxMailbox} onExportMailbox={handleExportMailbox} onOpenDetails={setDetailMailbox} onRefresh={handleRefresh} onAdd={() => setAddOpen(true)} onImport={() => setTransferMode('import')} onExport={() => setTransferMode('export')} onRunBackup={handleRunBackup} backupRunning={backupRunning} />}
       {view === 'workspace' && <WorkspaceView platform={workspacePlatform} onPlatformChange={setWorkspacePlatform} />}
-      {view === 'settings' && <SettingsView onServerChange={refreshDashboardFromSettings} />}
+      {view === 'settings' && <SettingsView onServerChange={refreshDashboardFromSettings} mailboxes={dashboard?.mailboxes ?? []} />}
       <AddMailboxDialog open={addOpen} submitting={addingMailbox} managedMailboxes={(dashboard?.mailboxes ?? []).filter((mailbox) => mailbox.provider !== 'cloudflare')} onClose={() => setAddOpen(false)} onSubmit={handleAddMailbox} />
       {detailMailbox && <MailboxDetailDrawer mailbox={detailMailbox} onClose={() => setDetailMailbox(undefined)} />}
       {inboxMailbox && <MailboxInboxDialog mailbox={inboxMailbox} onClose={() => setInboxMailbox(undefined)} />}

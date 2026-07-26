@@ -17,7 +17,7 @@ export interface MailAuthSummary {
   modes: MailAccessMode[]
   refreshTokenExpiresAt?: string
   refreshStatus?: string
-  refreshTokenValidity?: 'no_fixed_expiry' | 'missing' | 'error' | 'unknown' | 'not_applicable'
+  refreshTokenValidity?: 'expiry_not_returned' | 'missing' | 'error' | 'unknown' | 'not_applicable'
   graphAccessTokenExpiresAt?: string
   imapAccessTokenExpiresAt?: string
   autoRefresh: boolean
@@ -111,7 +111,8 @@ export interface RevealedCredential {
 export type MessageFolder = 'INBOX' | 'Junk'
 
 export interface CachedMessage {
-  id: string
+	id: string
+	mailboxId: string
   providerMessageId: string
   internetMessageId?: string
   folder: MessageFolder
@@ -121,8 +122,10 @@ export interface CachedMessage {
   subject: string
   text?: string
   html?: string
-  receivedAt: string
-  unread: boolean
+	receivedAt: string
+	unread: boolean
+	viewedAt?: string
+	retrievalMethod?: string
 }
 
 export interface MessageSyncState {
@@ -130,13 +133,33 @@ export interface MessageSyncState {
   lastMessageAt?: string
   lastSyncedAt: string
   lastError?: string
+  retrievalMethod?: string
+  cursor?: string
+  uidValidity?: number
+  highestUid?: number
 }
 
 export interface CachedMessagesResult {
   messages: CachedMessage[]
   count: number
   newCount: number
-  sync?: MessageSyncState
+	sync?: MessageSyncState
+	complete: boolean
+}
+
+export interface ManagedCacheQuery {
+	mailboxId?: string
+	folder?: MessageFolder
+	after?: string
+	before?: string
+	query?: string
+	limit?: number
+	offset?: number
+}
+
+export interface ManagedCacheResult {
+	messages: CachedMessage[]
+	count: number
 }
 
 export interface ProviderConnection {

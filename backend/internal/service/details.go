@@ -13,11 +13,12 @@ import (
 )
 
 type MailboxDetailService struct {
-	mailboxes ports.MailboxRepository
-	accounts  ports.PlatformAccountRepository
-	secrets   ports.SecretBroker
-	settings  CredentialRefreshSettingsReader
-	clock     func() time.Time
+	mailboxes    ports.MailboxRepository
+	accounts     ports.PlatformAccountRepository
+	secrets      ports.SecretBroker
+	settings     CredentialRefreshSettingsReader
+	capabilities ports.RetrievalCapabilityRepository
+	clock        func() time.Time
 }
 
 func NewMailboxDetailService(mailboxes ports.MailboxRepository, accounts ports.PlatformAccountRepository, secrets ports.SecretBroker) (*MailboxDetailService, error) {
@@ -29,6 +30,10 @@ func NewMailboxDetailService(mailboxes ports.MailboxRepository, accounts ports.P
 
 func (s *MailboxDetailService) SetSettingsReader(settings CredentialRefreshSettingsReader) {
 	s.settings = settings
+}
+
+func (s *MailboxDetailService) SetCapabilityRepository(repository ports.RetrievalCapabilityRepository) {
+	s.capabilities = repository
 }
 
 type CredentialSummary struct {
@@ -125,7 +130,43 @@ func (s *MailboxDetailService) Summaries(ctx context.Context, mailboxID string, 
 	for _, credential := range credentials {
 		summaries = append(summaries, s.summarizeCredential(ctx, credential, autoRefresh))
 	}
+	s.applyPersistedCapabilities(ctx, mailboxID, summaries)
 	return summaries, nil
+}
+
+func (s *MailboxDetailService) applyPersistedCapabilities(ctx context.Context, mailboxID string, summaries []CredentialSummary) {
+	if s.capabilities == nil {
+		return
+	}
+	items, err := s.capabilities.ListRetrievalCapabilities(ctx, mailboxID)
+	if err != nil {
+		return
+	}
+	byMethod := make(map[domain.RetrievalMethod]domain.MailboxRetrievalCapability, len(items))
+	for _, item := range items {
+		byMethod[item.Method] = item
+	}
+	for summaryIndex := range summaries {
+		for capabilityIndex := range summaries[summaryIndex].RetrievalCapabilities {
+			capability := &summaries[summaryIndex].RetrievalCapabilities[capabilityIndex]
+			persisted, ok := byMethod[capability.Method]
+			if !ok {
+				continue
+			}
+			switch persisted.Status {
+			case domain.RetrievalCapabilityAvailable:
+				capability.Status = "verified"
+			case domain.RetrievalCapabilityUnavailable, domain.RetrievalCapabilityError:
+				capability.Status = "failed"
+			case domain.RetrievalCapabilityPending:
+				capability.Status = "configured"
+			}
+			capability.CheckedAt = copyCredentialTime(persisted.CheckedAt)
+			if persisted.TokenExpiresAt != nil {
+				capability.AccessTokenExpiresAt = copyCredentialTime(persisted.TokenExpiresAt)
+			}
+		}
+	}
 }
 
 func (s *MailboxDetailService) summarizeCredential(ctx context.Context, credential domain.MailboxCredential, autoRefresh bool) CredentialSummary {
@@ -211,6 +252,9 @@ func (s *MailboxDetailService) Reveal(ctx context.Context, mailboxID string, kin
 		clientID = secret.ClientID
 	}
 	summary := s.summarizeCredential(ctx, credential, false)
+	summaries := []CredentialSummary{summary}
+	s.applyPersistedCapabilities(ctx, mailboxID, summaries)
+	summary = summaries[0]
 	return RevealedCredential{
 		ClientID: clientID, RefreshToken: refreshToken,
 		CredentialType: credential.Kind, RetrievalMethods: credentialRetrievalMethods(credential.Kind),
@@ -286,7 +330,7 @@ func (s *MailboxDetailService) openMailboxSecret(ctx context.Context, credential
 
 func microsoftGraphAccessTokenPresent(secret domain.MicrosoftCredentialSecret) bool {
 	return strings.TrimSpace(secret.GraphAccessToken) != "" ||
-		((secret.AccessTokenMethod == domain.RetrievalMicrosoftGraph || secret.AccessTokenMethod == domain.RetrievalOutlookREST) && strings.TrimSpace(secret.AccessToken) != "")
+		(secret.AccessTokenMethod == domain.RetrievalMicrosoftGraph && strings.TrimSpace(secret.AccessToken) != "")
 }
 
 func microsoftIMAPAccessTokenPresent(secret domain.MicrosoftCredentialSecret) bool {
@@ -297,11 +341,11 @@ func microsoftIMAPAccessTokenPresent(secret domain.MicrosoftCredentialSecret) bo
 func credentialRetrievalMethods(kind domain.CredentialKind) []domain.RetrievalMethod {
 	switch kind {
 	case domain.CredentialMicrosoftGraphOAuth:
-		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST}
+		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph}
 	case domain.CredentialMicrosoftIMAPOAuth:
 		return []domain.RetrievalMethod{domain.RetrievalIMAPOAuth}
 	case domain.CredentialMicrosoftDualToken:
-		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth}
+		return []domain.RetrievalMethod{domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth}
 	case domain.CredentialGmailOAuth:
 		return []domain.RetrievalMethod{domain.RetrievalGmailAPI}
 	case domain.CredentialIMAPPassword:
@@ -430,7 +474,7 @@ func refreshTokenValidity(kind domain.CredentialKind, hasRefreshToken bool, refr
 		return "error"
 	}
 	if hasRefreshToken {
-		return "no_fixed_expiry"
+		return "expiry_not_returned"
 	}
 	return "missing"
 }
@@ -441,7 +485,7 @@ func retrievalCapabilities(now time.Time, credential domain.MailboxCredential, s
 	for _, method := range summary.RetrievalMethods {
 		capability := RetrievalCapabilitySummary{Method: method, Status: "unknown"}
 		switch method {
-		case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
+		case domain.RetrievalMicrosoftGraph:
 			capability.AccessTokenExpiresAt = copyCredentialTime(secret.GraphTokenExpiresAt)
 		case domain.RetrievalIMAPOAuth:
 			capability.AccessTokenExpiresAt = copyCredentialTime(secret.IMAPTokenExpiresAt)
@@ -493,7 +537,7 @@ func retrievalMethodRefreshFailed(message string, method domain.RetrievalMethod)
 		return false
 	}
 	switch method {
-	case domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST:
+	case domain.RetrievalMicrosoftGraph:
 		return strings.Contains(message, "graph") || strings.Contains(message, "outlook")
 	case domain.RetrievalIMAPOAuth, domain.RetrievalIMAPPassword:
 		return strings.Contains(message, "imap")

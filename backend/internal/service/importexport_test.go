@@ -57,11 +57,28 @@ func newTransferFixture(t *testing.T) transferFixture {
 	return transferFixture{store: store, broker: broker, pickup: pickup, transfer: transfer}
 }
 
-func TestRegisteredSixPartImportKeepsMailboxAndPlatformSecretsSeparate(t *testing.T) {
+func TestCustomSixPartImportKeepsMailboxAndPlatformSecretsSeparate(t *testing.T) {
 	fixture := newTransferFixture(t)
 	ctx := context.Background()
+	microsoft := domain.ProviderMicrosoft
+	format := domain.MailboxFormat{
+		ID: "format_test_platform_six", Name: "Test platform six-part", Kind: domain.MailboxFormatDelimited,
+		Direction: domain.MailboxFormatBoth, Delimiter: "----", Provider: &microsoft, Enabled: true,
+		Fields: []domain.MailboxFormatField{
+			{Column: "email", Target: "address", Required: true},
+			{Column: "platform_password", Target: "platform_account_password", Sensitive: true},
+			{Column: "password", Target: "password", Sensitive: true},
+			{Column: "client_id", Target: "client_id"},
+			{Column: "refresh_token", Target: "refresh_token", Sensitive: true},
+			{Column: "access_token", Target: "platform_access_token", Sensitive: true},
+		},
+		ParserConfig: json.RawMessage(`{"platform":"test-platform"}`),
+	}
+	if err := fixture.store.CreateMailboxFormat(ctx, format); err != nil {
+		t.Fatal(err)
+	}
 	result, err := fixture.transfer.Import(ctx, service.MailboxImportRequest{
-		FormatID: "fmt_builtin_registered6",
+		FormatID: format.ID,
 		Data: strings.Join([]string{
 			"owner@example.com----gpt-password----mail-password----client-fixture----refresh-fixture----access-fixture",
 			"invalid-address----too-few",
@@ -98,7 +115,7 @@ func TestRegisteredSixPartImportKeepsMailboxAndPlatformSecretsSeparate(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(accounts) != 1 || accounts[0].Platform != "chatgpt" {
+	if len(accounts) != 1 || accounts[0].Platform != "test-platform" {
 		t.Fatalf("platform accounts = %+v", accounts)
 	}
 	platformCredential, err := fixture.store.GetPlatformAccountCredential(ctx, accounts[0].ID, "login")

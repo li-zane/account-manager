@@ -100,15 +100,6 @@ func (w *MessageProbeWorker) RunOnce(ctx context.Context) error {
 				continue
 			}
 			jobs = w.appendDueTarget(ctx, jobs, mailbox.ID, "", dueBefore)
-			aliases, err := w.mailboxes.ListAliases(ctx, mailbox.ID, ports.ListOptions{Limit: 500})
-			if err != nil {
-				return err
-			}
-			for _, alias := range aliases {
-				if alias.Enabled {
-					jobs = w.appendDueTarget(ctx, jobs, "", alias.ID, dueBefore)
-				}
-			}
 		}
 		if len(mailboxes) < 500 {
 			break

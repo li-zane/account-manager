@@ -18,14 +18,16 @@ import (
 const maxImportRows = 5000
 
 type ImportExportService struct {
-	mailboxes         ports.MailboxRepository
-	formats           ports.MailboxFormatRepository
-	accounts          ports.PlatformAccountRepository
-	providers         ports.ProviderRegistry
-	secrets           ports.SecretBroker
-	pickupKey         PickupKeyPreparer
-	pickupKeyExporter PickupKeyExporter
-	clock             func() time.Time
+	mailboxes             ports.MailboxRepository
+	formats               ports.MailboxFormatRepository
+	accounts              ports.PlatformAccountRepository
+	providers             ports.ProviderRegistry
+	secrets               ports.SecretBroker
+	pickupKey             PickupKeyPreparer
+	pickupKeyExporter     PickupKeyExporter
+	capabilityInitializer CapabilityInitializer
+	initialSyncer         InitialSyncScheduler
+	clock                 func() time.Time
 }
 
 type PickupKeyPreparer interface {
@@ -35,6 +37,14 @@ type PickupKeyPreparer interface {
 type PickupKeyExporter interface {
 	Ensure(context.Context, string) (domain.MailboxPickupKey, error)
 	Reveal(context.Context, string) (string, error)
+}
+
+type CapabilityInitializer interface {
+	InitializeCapabilities(context.Context, []string) error
+}
+
+type InitialSyncScheduler interface {
+	ScheduleInitialSync(context.Context, []string) error
 }
 
 func NewImportExportService(mailboxes ports.MailboxRepository, formats ports.MailboxFormatRepository, accounts ports.PlatformAccountRepository, providers ports.ProviderRegistry, secrets ports.SecretBroker) (*ImportExportService, error) {
@@ -53,6 +63,14 @@ func (s *ImportExportService) SetPickupKeyPreparer(preparer PickupKeyPreparer) {
 
 func (s *ImportExportService) SetPickupKeyExporter(exporter PickupKeyExporter) {
 	s.pickupKeyExporter = exporter
+}
+
+func (s *ImportExportService) SetCapabilityInitializer(initializer CapabilityInitializer) {
+	s.capabilityInitializer = initializer
+}
+
+func (s *ImportExportService) SetInitialSyncScheduler(scheduler InitialSyncScheduler) {
+	s.initialSyncer = scheduler
 }
 
 type MailboxImportRequest struct {
@@ -203,6 +221,16 @@ func (s *ImportExportService) Import(ctx context.Context, request MailboxImportR
 			if _, err := s.pickupKeyExporter.Ensure(ctx, mailboxID); err != nil {
 				return ImportCommitResult{}, fmt.Errorf("ensure pickup key for mailbox %s: %w", mailboxID, err)
 			}
+		}
+	}
+	if s.capabilityInitializer != nil {
+		if err := s.capabilityInitializer.InitializeCapabilities(ctx, result.MailboxIDs); err != nil {
+			return ImportCommitResult{}, fmt.Errorf("initialize retrieval capabilities: %w", err)
+		}
+	}
+	if s.initialSyncer != nil {
+		if err := s.initialSyncer.ScheduleInitialSync(ctx, result.MailboxIDs); err != nil {
+			return ImportCommitResult{}, fmt.Errorf("schedule initial mailbox sync: %w", err)
 		}
 	}
 	mailboxCount, err := s.mailboxes.CountMailboxes(ctx)

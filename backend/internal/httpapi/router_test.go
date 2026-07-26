@@ -118,7 +118,7 @@ func TestMailboxOverviewAndBackupCompatibilityFlow(t *testing.T) {
 	if mailbox["auth"].(map[string]any)["auto_refresh"] != true {
 		t.Fatalf("managed mailbox auto refresh = %+v, want persisted default enabled", mailbox["auth"])
 	}
-	if mailbox["auth"].(map[string]any)["refresh_token_validity"] != "no_fixed_expiry" {
+	if mailbox["auth"].(map[string]any)["refresh_token_validity"] != "expiry_not_returned" {
 		t.Fatalf("managed mailbox RT validity = %+v", mailbox["auth"])
 	}
 	children := mailbox["children"].([]any)

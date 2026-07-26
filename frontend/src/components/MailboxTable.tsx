@@ -123,8 +123,8 @@ function ExpiryDetails({ mailbox }: { mailbox: MailboxRecord }) {
   const forwarded = mailbox.auth.modes.length === 1 && mailbox.auth.modes[0] === 'forward'
   if (forwarded || mailbox.auth.refreshTokenValidity === 'not_applicable') return <div className="expiry-cell"><strong>不适用</strong><small>转发取件</small></div>
   const status = mailbox.auth.refreshStatus
-  if (mailbox.auth.refreshTokenValidity === 'no_fixed_expiry') {
-    return <div className="expiry-cell"><strong>无固定到期日</strong><small>{status === 'active' ? 'RT 已配置' : status === 'due' ? 'AT 待维护' : 'RT 状态已同步'}</small></div>
+  if (mailbox.auth.refreshTokenValidity === 'expiry_not_returned') {
+    return <div className="expiry-cell"><strong>未返回到期日</strong><small>{status === 'active' ? 'RT 已配置' : status === 'due' ? 'AT 待维护' : '以最近兑换结果为准'}</small></div>
   }
   if (mailbox.auth.refreshTokenValidity === 'error') return <div className="expiry-cell"><strong className="text-danger">状态异常</strong><small>查看详情</small></div>
   if (mailbox.auth.refreshTokenValidity === 'missing') return <div className="expiry-cell"><strong className="text-danger">未配置 RT</strong><small>查看详情</small></div>

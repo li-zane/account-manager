@@ -126,3 +126,19 @@ func TestAutomaticPickupKeyMigrationEnforcesCrossInstanceUniqueness(t *testing.T
 		}
 	}
 }
+
+func TestCachedMessageViewedMigrationPersistsLocalReadState(t *testing.T) {
+	script, err := files.ReadFile("000010_cached_message_viewed_at.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := strings.ToLower(string(script))
+	for _, required := range []string{
+		"add column if not exists viewed_at timestamptz",
+		"where unread = true and viewed_at is null",
+	} {
+		if !strings.Contains(normalized, required) {
+			t.Fatalf("cached-message viewed migration is missing %q", required)
+		}
+	}
+}

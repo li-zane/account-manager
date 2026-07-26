@@ -23,6 +23,14 @@ type MailRetriever interface {
 	Refresh(ctx context.Context, mailbox domain.Mailbox, credential domain.MailboxCredential) (domain.RefreshedCredential, error)
 }
 
+type MethodAccessTokenManager interface {
+	EnsureAccessToken(context.Context, domain.Mailbox, domain.MailboxCredential, domain.RetrievalMethod, bool) (domain.RefreshedCredential, bool, error)
+}
+
+type IncrementalMailRetriever interface {
+	SyncIncremental(context.Context, domain.Mailbox, domain.MailboxCredential, domain.MessageSyncRequest) (domain.MessageSyncResult, error)
+}
+
 type ProviderRegistration struct {
 	Provider  MailboxProvider
 	Retriever MailRetriever

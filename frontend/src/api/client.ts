@@ -33,6 +33,8 @@ import type {
   MailboxAliasDetail,
   LinkedPlatformAccount,
   MailboxRecord,
+	ManagedCacheQuery,
+	ManagedCacheResult,
   MessageFolder,
   MessageProbeSettings,
   MessageSyncState,
@@ -57,7 +59,7 @@ type UnknownRecord = Record<string, unknown>
 export const builtInMailboxFormats: MailboxFormat[] = [
   {
     id: 'fmt_builtin_pickup2',
-    name: '邮箱与本站取件密钥',
+    name: '平台取件格式',
     kind: 'delimited',
     direction: 'both',
     delimiter: '----',
@@ -72,7 +74,7 @@ export const builtInMailboxFormats: MailboxFormat[] = [
   },
   {
     id: 'fmt_builtin_outlook4',
-    name: 'Outlook 4 段格式',
+    name: 'Outlook 邮箱凭证',
     kind: 'delimited',
     direction: 'both',
     delimiter: '----',
@@ -83,59 +85,6 @@ export const builtInMailboxFormats: MailboxFormat[] = [
       { column: 'password', target: 'password', sensitive: true },
       { column: 'client_id', target: 'client_id' },
       { column: 'refresh_token', target: 'refresh_token', sensitive: true },
-    ],
-    builtIn: true,
-    enabled: true,
-    version: 1,
-  },
-  {
-    id: 'fmt_builtin_registered6',
-    name: '平台注册 6 段格式',
-    kind: 'delimited',
-    direction: 'both',
-    delimiter: '----',
-    hasHeader: false,
-    provider: 'microsoft',
-    fields: [
-      { column: 'email', target: 'address', required: true },
-      { column: 'gpt_password', target: 'platform_account_password', sensitive: true },
-      { column: 'password', target: 'password', sensitive: true },
-      { column: 'client_id', target: 'client_id' },
-      { column: 'refresh_token', target: 'refresh_token', sensitive: true },
-      { column: 'access_token', target: 'platform_access_token', sensitive: true },
-    ],
-    builtIn: true,
-    enabled: true,
-    version: 1,
-  },
-  {
-    id: 'fmt_builtin_cf_routed3',
-    name: 'Cloudflare 域名邮箱 3 段',
-    kind: 'delimited',
-    direction: 'import',
-    delimiter: '----',
-    hasHeader: false,
-    provider: 'cloudflare_route',
-    fields: [
-      { column: 'email', target: 'address', required: true },
-      { column: 'gpt_password', target: 'platform_account_password', required: true, sensitive: true },
-      { column: 'mail_access_key', target: 'pickup_key', required: true, sensitive: true },
-    ],
-    builtIn: true,
-    enabled: true,
-    version: 1,
-  },
-  {
-    id: 'fmt_builtin_simple3',
-    name: '邮箱、GPT 密码、邮箱密码',
-    kind: 'delimited',
-    direction: 'both',
-    delimiter: '----',
-    hasHeader: false,
-    fields: [
-      { column: 'email', target: 'address', required: true },
-      { column: 'gpt_password', target: 'platform_account_password', required: true, sensitive: true },
-      { column: 'password', target: 'password', required: true, sensitive: true },
     ],
     builtIn: true,
     enabled: true,
@@ -258,7 +207,7 @@ function normalizeMailbox(value: unknown, parentId?: string): MailboxRecord | nu
       refreshStatus: optionalText(auth.refresh_status ?? value.refresh_status),
       refreshTokenValidity: (() => {
         const validity = text(auth.refresh_token_validity ?? value.refresh_token_validity)
-        return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+        return validity === 'expiry_not_returned' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
       })(),
       graphAccessTokenExpiresAt: text(auth.graph_access_token_expires_at ?? value.graph_access_token_expires_at) || undefined,
       imapAccessTokenExpiresAt: text(auth.imap_access_token_expires_at ?? value.imap_access_token_expires_at) || undefined,
@@ -382,7 +331,7 @@ function normalizeCredential(value: unknown): MailboxCredentialSummary | null {
     hasRefreshToken: bool(value.has_refresh_token, Boolean(maskedRefreshToken)),
     refreshTokenValidity: (() => {
       const validity = text(value.refresh_token_validity)
-      return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+      return validity === 'expiry_not_returned' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
     })(),
     expiresAt: optionalText(value.expires_at),
     graphTokenExpiresAt: optionalText(value.graph_token_expires_at),
@@ -484,6 +433,7 @@ function normalizeCachedMessage(value: unknown): CachedMessage | null {
   if (!id || !receivedAt) return null
   return {
     id,
+		mailboxId: text(value.mailbox_id),
     providerMessageId: text(value.provider_message_id),
     internetMessageId: optionalText(value.internet_message_id),
     folder: text(value.folder) === 'Junk' ? 'Junk' : 'INBOX',
@@ -495,6 +445,8 @@ function normalizeCachedMessage(value: unknown): CachedMessage | null {
     html: optionalText(value.html),
     receivedAt,
     unread: bool(value.unread),
+		viewedAt: optionalText(value.viewed_at),
+		retrievalMethod: optionalText(value.retrieval_method),
   }
 }
 
@@ -508,6 +460,10 @@ function normalizeMessageSyncState(value: unknown): MessageSyncState | undefined
     lastMessageAt: optionalText(value.last_message_at),
     lastSyncedAt,
     lastError: optionalText(value.last_error),
+    retrievalMethod: optionalText(value.retrieval_method),
+    cursor: optionalText(value.cursor),
+    uidValidity: Math.max(0, Math.trunc(numberValue(value.uid_validity))),
+    highestUid: Math.max(0, Math.trunc(numberValue(value.highest_uid))),
   }
 }
 
@@ -522,7 +478,20 @@ function normalizeCachedMessagesResult(value: unknown): CachedMessagesResult {
     count: Math.max(messages.length, Math.trunc(numberValue(payload.count, messages.length))),
     newCount: Math.max(0, Math.trunc(numberValue(payload.new_count))),
     sync: normalizeMessageSyncState(payload.sync),
+		complete: bool(payload.complete),
   }
+}
+
+function managedCacheQuery(value: ManagedCacheQuery): string {
+	const query = new URLSearchParams()
+	if (value.mailboxId) query.set('mailbox_id', value.mailboxId)
+	if (value.folder) query.set('folder', value.folder)
+	if (value.after) query.set('after', value.after)
+	if (value.before) query.set('before', value.before)
+	if (value.query) query.set('q', value.query)
+	if (value.limit) query.set('limit', String(value.limit))
+	if (value.offset) query.set('offset', String(value.offset))
+	return query.toString()
 }
 
 function normalizeMailboxDetail(value: unknown): MailboxDetail {
@@ -1031,7 +1000,7 @@ export const apiClient = {
       retrievalCapabilities: normalizeRetrievalCapabilities(payload.retrieval_capabilities),
       refreshTokenValidity: (() => {
         const validity = text(payload.refresh_token_validity)
-        return validity === 'no_fixed_expiry' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
+      return validity === 'expiry_not_returned' || validity === 'missing' || validity === 'error' || validity === 'unknown' || validity === 'not_applicable' ? validity : undefined
       })(),
       expiresAt: optionalText(payload.expires_at),
       graphTokenExpiresAt: optionalText(payload.graph_token_expires_at),
@@ -1057,6 +1026,40 @@ export const apiClient = {
     const response = await request<unknown>(`${base}/messages/sync?${query.toString()}`, { method: 'POST' })
     return normalizeCachedMessagesResult(response)
   },
+
+	async markCachedMessageViewed(mailboxId: string, messageId: string): Promise<void> {
+		await request<unknown>(`/api/v1/mailboxes/${encodeURIComponent(mailboxId)}/cached-messages/${encodeURIComponent(messageId)}/viewed`, { method: 'POST' })
+	},
+
+	async queryManagedCache(input: ManagedCacheQuery, signal?: AbortSignal): Promise<ManagedCacheResult> {
+		const response = await request<unknown>(`/api/v1/message-cache?${managedCacheQuery(input)}`, { signal })
+		const payload = isRecord(response) && isRecord(response.data) ? response.data : response
+		if (!isRecord(payload)) throw new Error('邮件缓存响应格式无效')
+		return {
+			messages: (Array.isArray(payload.messages) ? payload.messages : []).map(normalizeCachedMessage).filter((item): item is CachedMessage => item !== null),
+			count: Math.max(0, Math.trunc(numberValue(payload.count))),
+		}
+	},
+
+	async deleteManagedCache(input: ManagedCacheQuery): Promise<number> {
+		const response = await request<unknown>(`/api/v1/message-cache?${managedCacheQuery(input)}`, { method: 'DELETE' })
+		return isRecord(response) ? Math.max(0, Math.trunc(numberValue(response.deleted))) : 0
+	},
+
+	async restoreManagedCache(mailboxId: string, input: ManagedCacheQuery): Promise<number> {
+		const response = await request<unknown>(`/api/v1/mailboxes/${encodeURIComponent(mailboxId)}/cached-messages/range?${managedCacheQuery(input)}`, { method: 'POST' })
+		return isRecord(response) ? Math.max(0, Math.trunc(numberValue(response.cached))) : 0
+	},
+
+	async exportManagedCache(input: ManagedCacheQuery): Promise<void> {
+		const response = await rawRequest(`/api/v1/message-cache/export?${managedCacheQuery(input)}`, { headers: { Accept: 'text/csv' } })
+		const url = URL.createObjectURL(await response.blob())
+		const link = document.createElement('a')
+		link.href = url
+		link.download = `mail-cache-${new Date().toISOString().slice(0, 10)}.csv`
+		link.click()
+		URL.revokeObjectURL(url)
+	},
 
   async getProviderConnections(signal?: AbortSignal): Promise<ProviderConnection[]> {
     const response = await request<unknown>('/api/v1/provider-connections', { signal })
@@ -1193,6 +1196,20 @@ export const apiClient = {
       content,
       contentType: response.headers.get('content-type') || 'text/csv;charset=utf-8',
       fileName,
+    }
+  },
+
+  async previewMailboxExport(input: MailboxExportRequest, signal?: AbortSignal): Promise<MailboxExportResult> {
+    const response = await request<unknown>('/api/v1/mailboxes/export/preview', {
+      method: 'POST', signal,
+      body: JSON.stringify({ format_id: input.formatId, mailbox_ids: input.mailboxIds, include_sensitive: input.includeSensitive }),
+    })
+    const payload = isRecord(response) && isRecord(response.data) ? response.data : response
+    if (!isRecord(payload)) throw new Error('导出预览响应格式无效')
+    return {
+      content: text(payload.content),
+      contentType: 'text/plain;charset=utf-8',
+      fileName: text(payload.filename, 'mailboxes-preview.txt'),
     }
   },
 }

@@ -76,9 +76,8 @@ func run(logger *slog.Logger) error {
 	}
 	providerHTTPClient := &http.Client{Timeout: 30 * time.Second}
 	microsoft := providers.NewMicrosoftAdapter(providers.MicrosoftConfig{
-		TokenEndpoint:      strings.TrimSpace(os.Getenv("MICROSOFT_TOKEN_ENDPOINT")),
-		GraphBaseURL:       strings.TrimSpace(os.Getenv("MICROSOFT_GRAPH_BASE_URL")),
-		OutlookRESTBaseURL: strings.TrimSpace(os.Getenv("MICROSOFT_OUTLOOK_REST_BASE_URL")),
+		TokenEndpoint: strings.TrimSpace(os.Getenv("MICROSOFT_TOKEN_ENDPOINT")),
+		GraphBaseURL:  strings.TrimSpace(os.Getenv("MICROSOFT_GRAPH_BASE_URL")),
 	}, broker, providerHTTPClient)
 	gmail := providers.NewGmailAdapter(broker, providerHTTPClient)
 	gmail.APIBase = strings.TrimSpace(os.Getenv("GMAIL_API_BASE_URL"))
@@ -131,6 +130,10 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("create token refresh settings service: %w", err)
 	}
 	retrieval.SetSettingsReader(tokenRefreshSettings)
+	retrieval.SetCapabilityRepository(store)
+	if err := initializeRetrievalCapabilities(rootCtx, store, retrieval); err != nil {
+		return fmt.Errorf("initialize retrieval capabilities: %w", err)
+	}
 	stopCredentialRefreshRuntime, err := startCredentialRefreshRuntime(rootCtx, store, retrieval, tokenRefreshSettings, logger)
 	if err != nil {
 		return err
@@ -140,6 +143,17 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	initialSyncWorker, err := service.NewInitialMessageSyncWorker(messageCache, logger, 2)
+	if err != nil {
+		return err
+	}
+	initialSyncCtx, stopInitialSync := context.WithCancel(rootCtx)
+	defer stopInitialSync()
+	go func() {
+		if err := initialSyncWorker.Run(initialSyncCtx); err != nil && initialSyncCtx.Err() == nil {
+			logger.Error("initial message sync worker stopped", "error", err)
+		}
+	}()
 	messageProbeSettings, err := service.NewMessageProbeSettingsService(store)
 	if err != nil {
 		return err
@@ -149,6 +163,11 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer stopMessageProbeRuntime()
+	stopCapabilityRuntime, err := startRetrievalCapabilityRuntime(rootCtx, store, retrieval, logger)
+	if err != nil {
+		return err
+	}
+	defer stopCapabilityRuntime()
 	accounts, err := service.NewAccountService(store, store)
 	if err != nil {
 		return err
@@ -165,12 +184,15 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	details.SetSettingsReader(tokenRefreshSettings)
+	details.SetCapabilityRepository(store)
 	transfers, err := service.NewImportExportService(store, store, store, registry, broker)
 	if err != nil {
 		return err
 	}
 	transfers.SetPickupKeyPreparer(pickupKeys)
 	transfers.SetPickupKeyExporter(pickupKeys)
+	transfers.SetCapabilityInitializer(retrieval)
+	transfers.SetInitialSyncScheduler(initialSyncWorker)
 	backups, err := service.NewBackupService(store, broker)
 	if err != nil {
 		return err
@@ -335,6 +357,73 @@ func startMessageProbeRuntime(parent context.Context, store ports.Store, cache *
 			}
 		})
 	}, nil
+}
+
+func initializeRetrievalCapabilities(ctx context.Context, store ports.MailboxRepository, initializer service.CapabilityInitializer) error {
+	for offset := 0; ; offset += 500 {
+		mailboxes, err := store.ListMailboxes(ctx, ports.ListOptions{Limit: 500, Offset: offset})
+		if err != nil {
+			return err
+		}
+		ids := make([]string, 0, len(mailboxes))
+		for _, mailbox := range mailboxes {
+			ids = append(ids, mailbox.ID)
+		}
+		if err := initializer.InitializeCapabilities(ctx, ids); err != nil {
+			return err
+		}
+		if len(mailboxes) < 500 {
+			return nil
+		}
+	}
+}
+
+func startRetrievalCapabilityRuntime(parent context.Context, repository ports.RetrievalCapabilityRepository, prober service.RetrievalCapabilityProber, logger *slog.Logger) (func(), error) {
+	if strings.EqualFold(envOrDefault("RETRIEVAL_CAPABILITY_WORKER_ENABLED", "true"), "false") {
+		return func() {}, nil
+	}
+	interval, err := envDuration("RETRIEVAL_CAPABILITY_WORKER_INTERVAL", time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	concurrency, err := envPositiveInt("RETRIEVAL_CAPABILITY_WORKER_CONCURRENCY", 2)
+	if err != nil {
+		return nil, err
+	}
+	worker := service.NewRetrievalCapabilityWorker(repository, prober, logger, interval, concurrency)
+	runtimeCtx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = worker.Run(runtimeCtx) }()
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); <-done }) }, nil
+}
+
+func startMessageCacheCleanupRuntime(parent context.Context, repository ports.MessageCacheRepository, logger *slog.Logger) (func(), error) {
+	if strings.EqualFold(envOrDefault("MESSAGE_CACHE_CLEANUP_WORKER_ENABLED", "true"), "false") {
+		return func() {}, nil
+	}
+	interval, err := envDuration("MESSAGE_CACHE_CLEANUP_INTERVAL", 6*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	retentionDays, err := envPositiveInt("MESSAGE_CACHE_RETENTION_DAYS", 30)
+	if err != nil {
+		return nil, err
+	}
+	maxPerFolder, err := envPositiveInt("MESSAGE_CACHE_MAX_PER_FOLDER", 5000)
+	if err != nil {
+		return nil, err
+	}
+	batchSize, err := envPositiveInt("MESSAGE_CACHE_CLEANUP_BATCH_SIZE", 1000)
+	if err != nil {
+		return nil, err
+	}
+	worker := service.NewMessageCacheCleanupWorker(repository, logger, interval, time.Duration(retentionDays)*24*time.Hour, maxPerFolder, batchSize)
+	runtimeCtx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = worker.Run(runtimeCtx) }()
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); <-done }) }, nil
 }
 
 func startBackupRuntime(parent context.Context, databaseURL string, store ports.Store, broker ports.SecretBroker, logger *slog.Logger) (httpapi.BackupRestoreCoordinator, func(), error) {

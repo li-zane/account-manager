@@ -85,7 +85,26 @@ func (s *FormatService) Get(ctx context.Context, id string) (domain.MailboxForma
 }
 
 func (s *FormatService) List(ctx context.Context, options ports.ListOptions) ([]domain.MailboxFormat, error) {
-	return s.repository.ListMailboxFormats(ctx, options)
+	items, err := s.repository.ListMailboxFormats(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	filtered := items[:0]
+	for _, item := range items {
+		if !deprecatedBuiltinFormat(item.ID) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func deprecatedBuiltinFormat(id string) bool {
+	switch id {
+	case "fmt_builtin_registered6", "fmt_builtin_simple3", "fmt_builtin_cf_routed3":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *FormatService) EnsureBuiltins(ctx context.Context) error {
@@ -223,10 +242,9 @@ func canonicalFormatTarget(target string) string {
 
 func builtinFormats(now time.Time) []domain.MailboxFormat {
 	microsoft := domain.ProviderMicrosoft
-	cloudflareRoute := domain.ProviderCloudflareRoute
 	return []domain.MailboxFormat{
 		{
-			ID: "fmt_builtin_pickup2", Name: "Email and platform pickup key", Kind: domain.MailboxFormatDelimited,
+			ID: "fmt_builtin_pickup2", Name: "平台取件格式", Kind: domain.MailboxFormatDelimited,
 			Direction: domain.MailboxFormatBoth, Delimiter: "----", Enabled: true, Builtin: true, Version: 1,
 			Fields: []domain.MailboxFormatField{
 				{Column: "email", Target: "address", Required: true},
@@ -235,7 +253,7 @@ func builtinFormats(now time.Time) []domain.MailboxFormat {
 			ParserConfig: json.RawMessage(`{"provider_from_address":true}`), CreatedAt: now, UpdatedAt: now,
 		},
 		{
-			ID: "fmt_builtin_outlook4", Name: "Outlook 4-part", Kind: domain.MailboxFormatDelimited,
+			ID: "fmt_builtin_outlook4", Name: "Outlook 邮箱凭证", Kind: domain.MailboxFormatDelimited,
 			Direction: domain.MailboxFormatBoth, Delimiter: "----", Provider: &microsoft, Enabled: true, Builtin: true, Version: 1,
 			Fields: []domain.MailboxFormatField{
 				{Column: "email", Target: "address", Required: true},
@@ -244,39 +262,6 @@ func builtinFormats(now time.Time) []domain.MailboxFormat {
 				{Column: "refresh_token", Target: "refresh_token", Sensitive: true},
 			},
 			ParserConfig: json.RawMessage(`{"credential_kind":"microsoft_dual_token"}`), CreatedAt: now, UpdatedAt: now,
-		},
-		{
-			ID: "fmt_builtin_registered6", Name: "Registered 6-part", Kind: domain.MailboxFormatDelimited,
-			Direction: domain.MailboxFormatBoth, Delimiter: "----", Provider: &microsoft, Enabled: true, Builtin: true, Version: 1,
-			Fields: []domain.MailboxFormatField{
-				{Column: "email", Target: "address", Required: true},
-				{Column: "gpt_password", Target: "platform_account_password", Sensitive: true},
-				{Column: "password", Target: "password", Sensitive: true},
-				{Column: "client_id", Target: "client_id"},
-				{Column: "refresh_token", Target: "refresh_token", Sensitive: true},
-				{Column: "access_token", Target: "platform_access_token", Sensitive: true},
-			},
-			ParserConfig: json.RawMessage(`{"platform":"chatgpt"}`), CreatedAt: now, UpdatedAt: now,
-		},
-		{
-			ID: "fmt_builtin_cf_routed3", Name: "Cloudflare routed 3-part", Kind: domain.MailboxFormatDelimited,
-			Direction: domain.MailboxFormatImport, Delimiter: "----", Provider: &cloudflareRoute, Enabled: true, Builtin: true, Version: 1,
-			Fields: []domain.MailboxFormatField{
-				{Column: "email", Target: "address", Required: true},
-				{Column: "gpt_password", Target: "platform_account_password", Required: true, Sensitive: true},
-				{Column: "mail_access_key", Target: "pickup_key", Required: true, Sensitive: true},
-			},
-			ParserConfig: json.RawMessage(`{"platform":"chatgpt"}`), CreatedAt: now, UpdatedAt: now,
-		},
-		{
-			ID: "fmt_builtin_simple3", Name: "Email, GPT password and mailbox password", Kind: domain.MailboxFormatDelimited,
-			Direction: domain.MailboxFormatBoth, Delimiter: "----", Enabled: true, Builtin: true, Version: 1,
-			Fields: []domain.MailboxFormatField{
-				{Column: "email", Target: "address", Required: true},
-				{Column: "gpt_password", Target: "platform_account_password", Required: true, Sensitive: true},
-				{Column: "password", Target: "password", Required: true, Sensitive: true},
-			},
-			ParserConfig: json.RawMessage(`{"platform":"chatgpt","provider_from_address":true}`), CreatedAt: now, UpdatedAt: now,
 		},
 	}
 }

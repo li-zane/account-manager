@@ -14,7 +14,7 @@ provider-neutral 接口边界，不复制其桌面软件的数据模型。
 | 能力 | Account Manager 实现 |
 | --- | --- |
 | 批量导入与导出 | 预览式批量导入、冲突策略、Outlook 四段格式和自定义格式 |
-| Microsoft OAuth 取件 | 一个共享 RT，Graph/REST 与 IMAP 双通道 |
+| Microsoft OAuth 取件 | 一个共享 RT，Graph 与 IMAP 双通道 |
 | 凭据和能力检查 | 详情展示 RT 状态、通道配置/验证状态和通道 AT 时间 |
 | 邮件目录 | 收件箱与垃圾箱快速切换 |
 | 本地邮件存储 | PostgreSQL 缓存、去重和增量游标 |
@@ -26,7 +26,7 @@ provider-neutral 接口边界，不复制其桌面软件的数据模型。
 
 ## 语义约束
 
-- “双通道”表示同一个 RT 可服务 Graph/REST 和 IMAP，不表示存在两份 RT。
+- “双通道”表示同一个 RT 可服务 Graph 和 IMAP，不表示存在两份 RT。
 - Microsoft RT 通常没有可直接读取的固定到期日。界面显示 RT 状态为
   “无固定到期日”，Graph/IMAP 时间只代表短期 AT。
 - 已配置表示凭据具备该通道的必要字段；已验证需要通道级验证记录。过往

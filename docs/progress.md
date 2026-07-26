@@ -27,7 +27,7 @@
 ### Mail retrieval and credentials
 
 - Implemented Microsoft Graph and Outlook IMAP retrieval, Gmail API and IMAP retrieval, refresh-token rotation, pagination bounds, folder/query mapping, and redacted upstream errors.
-- Implemented one canonical Microsoft RT shared by Graph/REST and IMAP, with read compatibility for legacy split-token fields. Dual-channel refresh runs Graph first, persists a rotated-token checkpoint, then runs IMAP with the current chain token.
+- Implemented one canonical Microsoft RT shared by Graph and IMAP, with read compatibility for legacy split-token fields. Dual-channel refresh runs Graph first, persists a rotated-token checkpoint, then runs IMAP with the current chain token.
 - Added persisted token-refresh settings (`enabled`, lead time, version) and a worker that reloads them each pass, paginates mailbox scans, bounds concurrency and per-item time, backs off errors, and coalesces concurrent on-demand refreshes.
 - Added administrator and platform pickup-key retrieval endpoints. Pickup keys are HMAC-digested, scoped to one mailbox, revocable/expirable, and may select only aliases belonging to that mailbox.
 - Enforced fail-closed alias filtering against exact normalized recipients from provider-native recipient fields and accepted envelope/original-recipient headers. A parent mailbox match alone is insufficient.
@@ -70,3 +70,11 @@
 - A real Gmail-forwarding IMAP connection passed through the new Go backend over direct TLS. The live alias query returned six exact-recipient messages and a same-domain sibling query returned zero, confirming fail-closed isolation without recording addresses or content.
 - An Outlook fixture sent through the existing Cloudflare catch-all was recorded as forwarded and appeared in Gmail Junk. The Go alias query returned one exact match and a same-domain sibling returned zero; no Cloudflare rule or destination was changed.
 - Real S3/WebDAV credentials and a deployment PostgreSQL restore drill remain environment-specific acceptance work; adapter, worker, CAS, scheduling, checksum, and restore HTTP behavior are covered by automated tests.
+
+## 2026-07-25 Microsoft retrieval verification
+
+- Microsoft retrieval now caches method-specific Graph/IMAP AT values, refreshes an expired AT on demand, prefers Graph, and persists Graph delta or IMAP UID cursors for incremental synchronization.
+- Graph refresh retries with `https://graph.microsoft.com/.default` when the imported app grant rejects an explicit `Mail.Read offline_access` request with `invalid_grant`.
+- The mailbox overview and inbox method selector expose only methods whose capability probe is `verified`; configured or failed methods remain available for diagnostics in the detail model but are hidden as pickup choices.
+- `sandrapickering2638@outlook.com` passes Graph refresh and delta synchronization. Its IMAP XOAUTH2 attempt is rejected by Microsoft with `BAD Command Argument Error. 12`, so this mailbox correctly displays only Graph.
+- Final backend tests/vet, frontend typecheck/build, Compose validation, diff checks, and deployed browser synchronization all pass.

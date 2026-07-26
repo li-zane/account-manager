@@ -78,6 +78,32 @@ type MessageCacheRepository interface {
 	ListCachedMessages(ctx context.Context, mailboxID string, folder domain.MessageFolder, recipientAddress string, options ListOptions) ([]domain.CachedMessage, error)
 	GetMessageSyncState(ctx context.Context, targetID string, folder domain.MessageFolder) (domain.MessageSyncState, error)
 	SaveMessageSyncState(ctx context.Context, state domain.MessageSyncState) error
+	DeleteCachedMessages(ctx context.Context, mailboxID string, folder domain.MessageFolder, method domain.RetrievalMethod, providerIDs []string) (int, error)
+	PurgeCachedMessages(ctx context.Context, mailboxID string, folder domain.MessageFolder, before *time.Time, limit int) (int, error)
+	CleanupCachedMessages(ctx context.Context, before time.Time, maxPerMailboxFolder, batchSize int) (int, error)
+	ResetMessageSyncState(ctx context.Context, targetID string, folder domain.MessageFolder) error
+	QueryCachedMessages(ctx context.Context, filter MessageCacheFilter, options ListOptions) ([]domain.CachedMessage, int64, error)
+	DeleteCachedMessagesRange(ctx context.Context, filter MessageCacheFilter, limit int) (int, error)
+	MarkCachedMessageViewed(ctx context.Context, mailboxID, messageID string, viewedAt time.Time) error
+}
+
+type MessageCacheFilter struct {
+	MailboxID string
+	Folder    domain.MessageFolder
+	After     *time.Time
+	Before    *time.Time
+	Search    string
+}
+
+type RetrievalCapabilityRepository interface {
+	UpsertRetrievalCapability(ctx context.Context, capability domain.MailboxRetrievalCapability) error
+	GetRetrievalCapability(ctx context.Context, mailboxID string, method domain.RetrievalMethod) (domain.MailboxRetrievalCapability, error)
+	ListRetrievalCapabilities(ctx context.Context, mailboxID string) ([]domain.MailboxRetrievalCapability, error)
+	ListPendingRetrievalCapabilities(ctx context.Context, limit int) ([]domain.MailboxRetrievalCapability, error)
+}
+
+type CredentialRefreshLocker interface {
+	AcquireCredentialRefreshLock(ctx context.Context, key string) (func(), error)
 }
 
 type PlatformAccountRepository interface {
@@ -132,6 +158,7 @@ type Store interface {
 	MailboxFormatRepository
 	PickupKeyRepository
 	MessageCacheRepository
+	RetrievalCapabilityRepository
 	PlatformAccountRepository
 	BackupRepository
 	BackupRunClaimer

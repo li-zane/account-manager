@@ -88,6 +88,9 @@ func retrieveMicrosoftIMAP(ctx context.Context, secret domain.MicrosoftCredentia
 	if query.After != nil {
 		criteria.Since = query.After.UTC()
 	}
+	if query.Before != nil {
+		criteria.Before = query.Before.UTC()
+	}
 	if query.Unread {
 		criteria.WithoutFlags = []string{imap.SeenFlag}
 	}
@@ -134,6 +137,11 @@ func retrieveMicrosoftIMAP(ctx context.Context, secret domain.MicrosoftCredentia
 }
 
 func selectMicrosoftIMAPFolder(client *imapclient.Client, secret domain.MicrosoftCredentialSecret, folder domain.MessageFolder) (string, error) {
+	name, _, err := selectMicrosoftIMAPFolderStatus(client, secret, folder)
+	return name, err
+}
+
+func selectMicrosoftIMAPFolderStatus(client *imapclient.Client, secret domain.MicrosoftCredentialSecret, folder domain.MessageFolder) (string, *imap.MailboxStatus, error) {
 	var candidates []string
 	switch folder {
 	case "", domain.MessageFolderInbox:
@@ -144,14 +152,104 @@ func selectMicrosoftIMAPFolder(client *imapclient.Client, secret domain.Microsof
 			candidates = append(candidates, "Junk Email")
 		}
 	default:
-		return "", fmt.Errorf("%w: unsupported Microsoft IMAP folder %q", domain.ErrInvalid, folder)
+		return "", nil, fmt.Errorf("%w: unsupported Microsoft IMAP folder %q", domain.ErrInvalid, folder)
 	}
 	for _, candidate := range candidates {
-		if _, err := client.Select(candidate, true); err == nil {
-			return candidate, nil
+		if status, err := client.Select(candidate, true); err == nil {
+			return candidate, status, nil
 		}
 	}
-	return "", fmt.Errorf("Microsoft IMAP folder selection failed")
+	return "", nil, fmt.Errorf("Microsoft IMAP folder selection failed")
+}
+
+func syncMicrosoftIMAP(ctx context.Context, secret domain.MicrosoftCredentialSecret, request domain.MessageSyncRequest) (domain.MessageSyncResult, error) {
+	username := strings.TrimSpace(secret.IMAPUsername)
+	if username == "" || strings.TrimSpace(secret.IMAPAccessToken) == "" {
+		return domain.MessageSyncResult{}, fmt.Errorf("%w: Microsoft IMAP username and access token are required", domain.ErrInvalid)
+	}
+	host := firstNonEmpty(secret.IMAPHost, defaultMicrosoftIMAPHost)
+	port := secret.IMAPPort
+	if port == 0 {
+		port = defaultMicrosoftIMAPPort
+	}
+	dialer, err := imapDialer(secret.IMAPProxyURL)
+	if err != nil {
+		return domain.MessageSyncResult{}, err
+	}
+	client, err := imapclient.DialWithDialerTLS(dialer, net.JoinHostPort(host, strconv.Itoa(port)), &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		return domain.MessageSyncResult{}, fmt.Errorf("connect to Microsoft IMAP: %w", err)
+	}
+	client.ErrorLog = log.New(io.Discard, "", 0)
+	client.Timeout = 25 * time.Second
+	defer func() { _ = client.Logout() }()
+	doneWatch := make(chan struct{})
+	defer close(doneWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Terminate()
+		case <-doneWatch:
+		}
+	}()
+	if err := client.Authenticate(&microsoftXOAUTH2Client{username: username, accessToken: secret.IMAPAccessToken}); err != nil {
+		return domain.MessageSyncResult{}, fmt.Errorf("%w: Microsoft IMAP authentication failed", domain.ErrUnauthorized)
+	}
+	_, status, err := selectMicrosoftIMAPFolderStatus(client, secret, request.Folder)
+	if err != nil {
+		return domain.MessageSyncResult{}, err
+	}
+	uidValidity := status.UidValidity
+	highestUID := request.HighestUID
+	if request.UIDValidity != 0 && request.UIDValidity != uidValidity {
+		highestUID = 0
+	}
+	criteria := imap.NewSearchCriteria()
+	if highestUID > 0 {
+		set := new(imap.SeqSet)
+		set.AddRange(highestUID+1, 0)
+		criteria.Uid = set
+	}
+	uids, err := client.UidSearch(criteria)
+	if err != nil {
+		return domain.MessageSyncResult{}, fmt.Errorf("search Microsoft IMAP messages: %w", err)
+	}
+	limit := request.Limit
+	if limit <= 0 || limit > maxMicrosoftMessageLimit {
+		limit = maxMicrosoftMessageLimit
+	}
+	complete := len(uids) <= limit
+	if len(uids) > limit {
+		uids = uids[:limit]
+	}
+	result := domain.MessageSyncResult{UIDValidity: uidValidity, HighestUID: highestUID, Complete: complete}
+	if len(uids) == 0 {
+		return result, nil
+	}
+	sequence := new(imap.SeqSet)
+	sequence.AddNum(uids...)
+	section := &imap.BodySectionName{Peek: true}
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, imap.FetchInternalDate, section.FetchItem()}
+	fetched := make(chan *imap.Message, len(uids))
+	fetchDone := make(chan error, 1)
+	go func() { fetchDone <- client.UidFetch(sequence, items, fetched) }()
+	for item := range fetched {
+		if item.Uid > result.HighestUID {
+			result.HighestUID = item.Uid
+		}
+		body := item.GetBody(section)
+		if body == nil {
+			continue
+		}
+		message, normalizeErr := normalizeIMAPMessage(item.Uid, item.Flags, item.InternalDate, body)
+		if normalizeErr == nil {
+			result.Messages = append(result.Messages, message)
+		}
+	}
+	if err := <-fetchDone; err != nil {
+		return domain.MessageSyncResult{}, fmt.Errorf("fetch Microsoft IMAP messages: %w", err)
+	}
+	return result, nil
 }
 
 type microsoftXOAUTH2Client struct {
@@ -182,10 +280,7 @@ func (c *microsoftXOAUTH2Client) Next([]byte) ([]byte, error) {
 func microsoftRetrievalMethod(kind domain.CredentialKind, requested domain.RetrievalMethod) (domain.RetrievalMethod, error) {
 	switch kind {
 	case domain.CredentialMicrosoftGraphOAuth:
-		if requested == "" || requested == domain.RetrievalMicrosoftGraph || requested == domain.RetrievalOutlookREST {
-			if requested == domain.RetrievalOutlookREST {
-				return domain.RetrievalOutlookREST, nil
-			}
+		if requested == "" || requested == domain.RetrievalMicrosoftGraph {
 			return domain.RetrievalMicrosoftGraph, nil
 		}
 	case domain.CredentialMicrosoftIMAPOAuth:
@@ -195,9 +290,6 @@ func microsoftRetrievalMethod(kind domain.CredentialKind, requested domain.Retri
 	case domain.CredentialMicrosoftDualToken:
 		if requested == "" || requested == domain.RetrievalMicrosoftGraph {
 			return domain.RetrievalMicrosoftGraph, nil
-		}
-		if requested == domain.RetrievalOutlookREST {
-			return domain.RetrievalOutlookREST, nil
 		}
 		if requested == domain.RetrievalIMAPOAuth {
 			return domain.RetrievalIMAPOAuth, nil

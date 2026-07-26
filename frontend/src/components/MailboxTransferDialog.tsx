@@ -62,6 +62,29 @@ function fieldValue(mailbox: MailboxRecord, target: string): string {
   }
 }
 
+const deprecatedFormatIds = new Set(['fmt_builtin_registered6', 'fmt_builtin_simple3', 'fmt_builtin_cf_routed3'])
+
+function formatLabel(format: MailboxFormat): string {
+  if (format.id === 'fmt_builtin_outlook4') return 'Outlook 邮箱凭证'
+  if (format.id === 'fmt_builtin_pickup2') return '平台取件格式'
+  return format.name
+}
+
+function formatExample(format: MailboxFormat): string {
+  if (format.kind === 'json') return JSON.stringify(Object.fromEntries(format.fields.map((field) => [field.column, field.target === 'address' ? 'email@example.com' : field.target])), null, 2)
+  const values = format.fields.map((field) => {
+    switch (field.target) {
+      case 'address': return 'email@example.com'
+      case 'pickup_key': return 'mail key'
+      case 'password': return 'PASSWORD'
+      case 'client_id': return 'CLIENT_ID'
+      case 'refresh_token': return 'REFRESH_TOKEN'
+      default: return field.target.toUpperCase()
+    }
+  })
+  return format.kind === 'template' ? (format.template || values.join('----')) : values.join(format.delimiter || '----')
+}
+
 function localExport(mailboxes: MailboxRecord[], format: MailboxFormat, ids: string[]): MailboxExportResult {
   const idSet = new Set(ids)
   const rows = flattenMailboxes(mailboxes).filter((mailbox) => idSet.size === 0 || idSet.has(mailbox.id))
@@ -212,7 +235,7 @@ function TransferPreview({ preview }: { preview: MailboxImportPreview }) {
 export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedIds, source, onClose, onImported }: MailboxTransferDialogProps) {
   const [mode, setMode] = useState<TransferMode>(initialMode)
   const [formats, setFormats] = useState<MailboxFormat[]>(builtInMailboxFormats)
-  const [formatId, setFormatId] = useState(builtInMailboxFormats[0].id)
+  const [formatId, setFormatId] = useState('fmt_builtin_outlook4')
   const [formatsLoading, setFormatsLoading] = useState(false)
   const [formatWarning, setFormatWarning] = useState<string>()
   const [showFormatEditor, setShowFormatEditor] = useState(false)
@@ -245,6 +268,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
     return new Set(roots.map((mailbox) => mailbox.provider === 'cloudflare' ? 'cloudflare_route' : mailbox.provider === 'google' ? 'gmail' : 'microsoft'))
   }, [exportScope, mailboxes, selectedIds])
   const availableFormats = useMemo(() => formats.filter((format) => {
+    if (deprecatedFormatIds.has(format.id)) return false
     if (!format.enabled || (format.direction !== 'both' && format.direction !== mode)) return false
     if (mode !== 'export' || !format.provider) return true
     return selectedProviders.size === 1 && selectedProviders.has(format.provider)
@@ -260,10 +284,12 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
   useEffect(() => {
     if (!open) return
     setMode(initialMode)
+    setFormatId(initialMode === 'import' ? 'fmt_builtin_outlook4' : 'fmt_builtin_pickup2')
     setError(undefined)
     setPreview(undefined)
     setImportResult(undefined)
     setExportResult(undefined)
+    setIncludeSensitive(initialMode === 'export')
     setExportScope(selectedIds.size > 0 ? 'selected' : 'all')
     if (source === 'mock') {
       setFormats(builtInMailboxFormats)
@@ -298,6 +324,17 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
   useEffect(() => {
     if (mode === 'export' && sensitiveRequired) setIncludeSensitive(true)
   }, [mode, sensitiveRequired])
+
+  useEffect(() => {
+    if (!open || mode !== 'export' || source !== 'api' || selectedRootIds.length === 0) return
+    const controller = new AbortController()
+    void apiClient.previewMailboxExport({ formatId: activeFormat.id, mailboxIds: selectedRootIds, includeSensitive: includeSensitive || sensitiveRequired }, controller.signal)
+      .then((result) => setExportResult(result))
+      .catch((reason) => {
+        if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : '导出预览失败')
+      })
+    return () => controller.abort()
+  }, [activeFormat.id, exportScope, includeSensitive, mode, open, selectedRootIds, sensitiveRequired, source])
 
   useEffect(() => {
     if (!open) return
@@ -432,7 +469,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
 
         <div className="transfer-dialog__body">
           <div className="format-toolbar">
-            <label className="transfer-field"><span>数据格式</span><span className="select-control select-control--wide"><select value={activeFormat.id} onChange={(event) => { setFormatId(event.target.value); setPreview(undefined); setExportResult(undefined) }} disabled={formatsLoading}>{availableFormats.map((format) => <option value={format.id} key={format.id}>{format.name}{format.builtIn ? ' · 内置' : ''}</option>)}</select><ChevronDown /></span></label>
+            <label className="transfer-field"><span>数据格式</span><span className="select-control select-control--wide"><select value={activeFormat.id} onChange={(event) => { setFormatId(event.target.value); setPreview(undefined); setExportResult(undefined) }} disabled={formatsLoading}>{availableFormats.map((format) => <option value={format.id} key={format.id}>{formatLabel(format)}{format.builtIn ? ' · 内置' : ''}</option>)}</select><ChevronDown /></span></label>
             <button className="secondary-button" type="button" onClick={() => setShowFormatEditor((value) => !value)}><Settings2 />自定义格式</button>
           </div>
           {formatWarning && <div className="inline-alert inline-alert--warning"><AlertCircle />{formatWarning}</div>}
@@ -456,6 +493,7 @@ export function MailboxTransferDialog({ open, initialMode, mailboxes, selectedId
 
           {mode === 'import' ? (
             <>
+              {!content.trim() && <div className="format-example" role="status"><span>格式预览</span><code>{formatExample(activeFormat)}</code></div>}
               <div className="import-source-tabs" role="tablist" aria-label="导入来源">
                 <button className={inputMode === 'file' ? 'source-tab source-tab--active' : 'source-tab'} type="button" role="tab" aria-selected={inputMode === 'file'} onClick={() => setInputMode('file')}><FileSpreadsheet />文件</button>
                 <button className={inputMode === 'text' ? 'source-tab source-tab--active' : 'source-tab'} type="button" role="tab" aria-selected={inputMode === 'text'} onClick={() => setInputMode('text')}><FileText />粘贴文本</button>

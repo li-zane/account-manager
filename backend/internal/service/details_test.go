@@ -60,19 +60,18 @@ func TestMicrosoftDualCredentialDetailAndReveal(t *testing.T) {
 	if summary.ClientID != "dual-client-id" || detail.ClientID != "dual-client-id" {
 		t.Fatalf("client IDs: summary=%q detail=%q", summary.ClientID, detail.ClientID)
 	}
-	if !sameRetrievalMethods(summary.RetrievalMethods, domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth) {
+	if !sameRetrievalMethods(summary.RetrievalMethods, domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth) {
 		t.Fatalf("retrieval methods = %v", summary.RetrievalMethods)
 	}
 	if !summary.HasRefreshToken {
 		t.Fatalf("refresh token flags = %+v", summary)
 	}
-	if summary.RefreshTokenValidity != "no_fixed_expiry" {
+	if summary.RefreshTokenValidity != "expiry_not_returned" {
 		t.Fatalf("refresh token validity = %q", summary.RefreshTokenValidity)
 	}
 	graphCapability := findRetrievalCapability(summary.RetrievalCapabilities, domain.RetrievalMicrosoftGraph)
-	restCapability := findRetrievalCapability(summary.RetrievalCapabilities, domain.RetrievalOutlookREST)
 	imapCapability := findRetrievalCapability(summary.RetrievalCapabilities, domain.RetrievalIMAPOAuth)
-	if graphCapability.Status != "verified" || restCapability.Status != "configured" || imapCapability.Status != "failed" {
+	if graphCapability.Status != "verified" || imapCapability.Status != "failed" {
 		t.Fatalf("retrieval capabilities = %+v", summary.RetrievalCapabilities)
 	}
 	if graphCapability.AccessTokenExpiresAt == nil || !graphCapability.AccessTokenExpiresAt.Equal(graphExpiresAt) || imapCapability.AccessTokenExpiresAt == nil || !imapCapability.AccessTokenExpiresAt.Equal(imapExpiresAt) {
@@ -121,7 +120,7 @@ func TestMicrosoftDualCredentialDetailAndReveal(t *testing.T) {
 	if revealed.RefreshToken != "shared-refresh-secret" {
 		t.Fatalf("revealed tokens = %+v", revealed)
 	}
-	if revealed.ClientID != "dual-client-id" || !sameRetrievalMethods(revealed.RetrievalMethods, domain.RetrievalMicrosoftGraph, domain.RetrievalOutlookREST, domain.RetrievalIMAPOAuth) {
+	if revealed.ClientID != "dual-client-id" || !sameRetrievalMethods(revealed.RetrievalMethods, domain.RetrievalMicrosoftGraph, domain.RetrievalIMAPOAuth) {
 		t.Fatalf("revealed identity/methods = %+v", revealed)
 	}
 	if revealed.ExpiresAt == nil || !revealed.ExpiresAt.Equal(imapExpiresAt) || revealed.GraphTokenExpiresAt == nil || !revealed.GraphTokenExpiresAt.Equal(graphExpiresAt) || revealed.IMAPTokenExpiresAt == nil || !revealed.IMAPTokenExpiresAt.Equal(imapExpiresAt) {

@@ -290,7 +290,8 @@ type gmailHeader struct {
 }
 
 type gmailBody struct {
-	Data string `json:"data"`
+	Data         string `json:"data"`
+	AttachmentID string `json:"attachmentId"`
 }
 
 func (a GmailAdapter) retrieveGmailAPI(ctx context.Context, accessToken string, query domain.MessageQuery) ([]domain.Message, error) {
@@ -299,9 +300,12 @@ func (a GmailAdapter) retrieveGmailAPI(ctx context.Context, accessToken string, 
 	result := make([]domain.Message, 0, limit)
 	for page := 0; page < maxPages && len(result) < limit; page++ {
 		values := url.Values{"maxResults": {strconv.Itoa(pageSize)}, "labelIds": {gmailLabel(query.Folder)}}
-		search := make([]string, 0, 2)
+		search := make([]string, 0, 3)
 		if query.After != nil {
 			search = append(search, "after:"+strconv.FormatInt(query.After.UTC().Unix(), 10))
+		}
+		if query.Before != nil {
+			search = append(search, "before:"+strconv.FormatInt(query.Before.UTC().Unix(), 10))
 		}
 		if query.Unread {
 			search = append(search, "is:unread")
@@ -322,8 +326,14 @@ func (a GmailAdapter) retrieveGmailAPI(ctx context.Context, accessToken string, 
 			if err := a.gmailJSON(ctx, accessToken, path, &raw); err != nil {
 				return nil, err
 			}
+			if err := a.hydrateGmailPayload(ctx, accessToken, raw.ID, &raw.Payload); err != nil {
+				return nil, err
+			}
 			message := normalizeGmailAPIMessage(raw)
 			if query.After != nil && message.ReceivedAt.Before(query.After.UTC()) {
+				continue
+			}
+			if query.Before != nil && !message.ReceivedAt.Before(query.Before.UTC()) {
 				continue
 			}
 			if query.RecipientAddress != "" && !MessageMatchesRecipient(message, query.RecipientAddress) {
@@ -341,6 +351,23 @@ func (a GmailAdapter) retrieveGmailAPI(ctx context.Context, accessToken string, 
 	}
 	sortMessages(result)
 	return result, nil
+}
+
+func (a GmailAdapter) hydrateGmailPayload(ctx context.Context, accessToken, messageID string, payload *gmailPayload) error {
+	if payload.Body.Data == "" && payload.Body.AttachmentID != "" {
+		var body gmailBody
+		path := "/users/me/messages/" + url.PathEscape(messageID) + "/attachments/" + url.PathEscape(payload.Body.AttachmentID)
+		if err := a.gmailJSON(ctx, accessToken, path, &body); err != nil {
+			return err
+		}
+		payload.Body.Data = body.Data
+	}
+	for index := range payload.Parts {
+		if err := a.hydrateGmailPayload(ctx, accessToken, messageID, &payload.Parts[index]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a GmailAdapter) gmailJSON(ctx context.Context, accessToken, path string, output any) error {
@@ -412,15 +439,24 @@ func normalizeGmailAPIMessage(raw gmailAPIMessage) domain.Message {
 
 func gmailPayloadBodies(payload gmailPayload) (string, string) {
 	var textParts, htmlParts []string
+	inlineImages := make(map[string]string)
 	var walk func(gmailPayload)
 	walk = func(part gmailPayload) {
 		if part.Body.Data != "" {
 			if decoded, err := decodeBase64URL(part.Body.Data); err == nil {
-				switch strings.ToLower(strings.TrimSpace(part.MIMEType)) {
+				contentType := strings.ToLower(strings.TrimSpace(part.MIMEType))
+				switch contentType {
 				case "text/plain":
 					textParts = append(textParts, string(decoded))
 				case "text/html":
 					htmlParts = append(htmlParts, string(decoded))
+				default:
+					if strings.HasPrefix(contentType, "image/") {
+						contentID := strings.Trim(strings.TrimSpace(gmailPayloadHeader(part, "Content-ID")), "<>")
+						if contentID != "" {
+							inlineImages[contentID] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(decoded)
+						}
+					}
 				}
 			}
 		}
@@ -429,7 +465,16 @@ func gmailPayloadBodies(payload gmailPayload) (string, string) {
 		}
 	}
 	walk(payload)
-	return strings.Join(textParts, "\n"), strings.Join(htmlParts, "\n")
+	return strings.Join(textParts, "\n"), replaceCIDImages(strings.Join(htmlParts, "\n"), inlineImages)
+}
+
+func gmailPayloadHeader(payload gmailPayload, name string) string {
+	for _, header := range payload.Headers {
+		if strings.EqualFold(strings.TrimSpace(header.Name), name) {
+			return header.Value
+		}
+	}
+	return ""
 }
 
 func decodeBase64URL(value string) ([]byte, error) {
@@ -484,6 +529,9 @@ func retrieveGmailIMAP(ctx context.Context, secret GmailCredentialSecret, query 
 	if query.After != nil {
 		criteria.Since = query.After.UTC()
 	}
+	if query.Before != nil {
+		criteria.Before = query.Before.UTC()
+	}
 	if query.Unread {
 		criteria.WithoutFlags = []string{imap.SeenFlag}
 	}
@@ -522,6 +570,9 @@ func retrieveGmailIMAP(ctx context.Context, secret GmailCredentialSecret, query 
 			continue
 		}
 		if query.After != nil && message.ReceivedAt.Before(query.After.UTC()) {
+			continue
+		}
+		if query.Before != nil && !message.ReceivedAt.Before(query.Before.UTC()) {
 			continue
 		}
 		if query.RecipientAddress != "" && !MessageMatchesRecipient(message, query.RecipientAddress) {
@@ -565,6 +616,7 @@ func normalizeIMAPMessage(uid uint32, flags []string, internalDate time.Time, bo
 		receivedAt = parsed.UTC()
 	}
 	var textParts, htmlParts []string
+	inlineImages := make(map[string]string)
 	for {
 		part, partErr := reader.NextPart()
 		if partErr == io.EOF {
@@ -573,12 +625,7 @@ func normalizeIMAPMessage(uid uint32, flags []string, internalDate time.Time, bo
 		if partErr != nil && !message.IsUnknownCharset(partErr) {
 			break
 		}
-		inline, ok := part.Header.(*mailmessage.InlineHeader)
-		if !ok {
-			_, _ = io.Copy(io.Discard, part.Body)
-			continue
-		}
-		contentType, _, _ := inline.ContentType()
+		contentType, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		content, readErr := io.ReadAll(io.LimitReader(part.Body, providerResponseBodyLimit))
 		if readErr != nil {
 			continue
@@ -588,6 +635,11 @@ func normalizeIMAPMessage(uid uint32, flags []string, internalDate time.Time, bo
 			textParts = append(textParts, string(content))
 		case "text/html":
 			htmlParts = append(htmlParts, string(content))
+		default:
+			contentID := strings.Trim(strings.TrimSpace(part.Header.Get("Content-ID")), "<>")
+			if contentID != "" && strings.HasPrefix(strings.ToLower(contentType), "image/") {
+				inlineImages[contentID] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(content)
+			}
 		}
 	}
 	subject, _ := reader.Header.Subject()
@@ -599,13 +651,21 @@ func normalizeIMAPMessage(uid uint32, flags []string, internalDate time.Time, bo
 		Cc:                cc,
 		Subject:           subject,
 		Text:              strings.Join(textParts, "\n"),
-		HTML:              strings.Join(htmlParts, "\n"),
+		HTML:              replaceCIDImages(strings.Join(htmlParts, "\n"), inlineImages),
 		ReceivedAt:        receivedAt,
 		Unread:            !containsFold(flags, imap.SeenFlag),
 		Headers:           headers,
 	}
 	msg.RecipientAddresses = ExtractRecipientAddresses(msg.To, msg.Cc, msg.Headers)
 	return msg, nil
+}
+
+func replaceCIDImages(htmlBody string, images map[string]string) string {
+	for contentID, dataURL := range images {
+		htmlBody = strings.ReplaceAll(htmlBody, "cid:"+contentID, dataURL)
+		htmlBody = strings.ReplaceAll(htmlBody, "cid:<"+contentID+">", dataURL)
+	}
+	return htmlBody
 }
 
 func gmailLabel(folder domain.MessageFolder) string {
